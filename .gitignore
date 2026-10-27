@@ -1,0 +1,33 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Angular / Node
+node_modules/
+dist/
+.angular/
+
+# IDE
+.idea/
+.vscode/
+
+# Build artifacts
+target/
+build/
+*.log
+
+# Temporary repositories and execution workspaces
+workspace/
+temp/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
