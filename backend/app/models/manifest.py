@@ -28,3 +28,28 @@ class JavaFileManifest(BaseModel):
     classes:List[JavaClassManifest]
     methods: List[JavaMethodManifest] = Field(default_factory=list)
     test_count:int
+
+class MigrationTarget(BaseModel):
+    identifier:str
+    file_path:str
+    package_name:Optional[str]=None
+    migration_depth:int
+    in_degree:int
+    out_degree:int
+    is_leaf:bool
+    is_test:bool
+    has_javax:bool
+
+class BlastRadiusEntry(BaseModel):
+    identifier:str
+    file_path:str
+    in_degree:int
+    affected_count:int
+    affected_identifiers:List[str]
+
+class DependencyGraphManifest(BaseModel):
+    total_nodes:int
+    total_edges:int
+    unresolved_import_count:int
+    migration_order:List[MigrationTarget]
+    high_blast_radius:List[BlastRadiusEntry]
