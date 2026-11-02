@@ -100,7 +100,7 @@ class DependencyGraphBuilder:
         return unresolved
 
     def _migration_depths(self)->Dict[str,int]:
-        if self.graph.number_of_nodes==0:
+        if self.graph.number_of_nodes()==0:
             return {}
 
         condensed=nx.condensation(self.graph)
