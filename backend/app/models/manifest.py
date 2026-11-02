@@ -53,3 +53,16 @@ class DependencyGraphManifest(BaseModel):
     unresolved_import_count:int
     migration_order:List[MigrationTarget]
     high_blast_radius:List[BlastRadiusEntry]
+
+class RepoInfo(BaseModel):
+    repo_url:str
+    target_path:str
+    active_branch:str
+    baseline_sha:str
+
+class ProjectIngestionReport(BaseModel):
+    repo_info:RepoInfo
+    pom:PomManifest
+    graph:DependencyGraphManifest
+    files_to_migrate:List[MigrationTarget]
+    baseline_test_count:int
