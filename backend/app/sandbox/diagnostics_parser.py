@@ -20,6 +20,7 @@ def extract_compiler_errors(raw_logs:str,container_workdir:str="/app")->List[Com
     lines=raw_logs.splitlines()
     errors:List[CompilerError]=[]
     seen:set=set()
+
     i=0
     while i<len(lines):
         match=_COMPILER_ERROR_RE.match(lines[i])
