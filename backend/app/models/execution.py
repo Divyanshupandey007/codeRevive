@@ -2,10 +2,9 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-
 class CompilerError(BaseModel):
     file_path:Optional[str]=None
-    line_number:Optional[str]=None
+    line_number:Optional[int]=None
     column:Optional[int]=None
     message:str
 
