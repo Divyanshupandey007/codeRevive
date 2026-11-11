@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -32,5 +32,12 @@ class Settings(BaseSettings):
     nvidia_api_key:str=""
     nvidia_base_url:str="https://integrate.api.nvidia.com/v1"
     nvidia_model:str="mistralai/mistral-large-4-1t-a52b"
+
+    # Guardrails
+    guardrail_forbidden_patterns:List[str]=Field(default_factory=lambda:[
+        "Runtime.getRuntime().exec",
+        "ProcessBuilder",
+        "System.exit"
+    ])
 
 settings=Settings()
