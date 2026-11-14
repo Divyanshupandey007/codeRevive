@@ -75,6 +75,7 @@ class _DockerSDKExecutor(_BuildExecutor):
                 volumes=volumes,
                 working_dir=container_workdir,
                 mem_limit=memory_limit,
+                shm_size="2g",
                 nano_cpus=int(cpu_count*1_000_000_000),
                 network_disabled=network_disabled,
                 detach=True,
@@ -119,6 +120,7 @@ class _DockerCLIExecutor(_BuildExecutor):
             "-v",f"{cache_volume}:/root/.m2",
             "-w",container_workdir,
             "--memory",memory_limit,
+            "--shm-size","2g",
             "--cpus",str(cpu_count)
         ]
         if network_disabled:

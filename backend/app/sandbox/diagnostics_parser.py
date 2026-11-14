@@ -55,6 +55,10 @@ def extract_compiler_errors(raw_logs:str,container_workdir:str="/app")->List[Com
 
     return errors
 
+_TEST_CLASS_HEADER_RE=re.compile(
+    r"^(?:\[ERROR\]\s*)?Tests run:.*<<<\s*(?:FAILURE|ERROR)!?\s*-\s*in\s+(?P<class>[\w$.]+)"
+)
+
 _TEST_FAILURE_HEADER_RE=re.compile(
     r"^(?:\[ERROR\]\s*)?"
     r"(?P<qualified>[\w$]+(?:\.[\w$]+)*)\s+"
@@ -66,8 +70,15 @@ _STACK_FRAME_RE=re.compile(r"^\s*(?:at\s|Caused by:|\.\.\.\s*\d+\s+more)")
 def extract_test_failures(raw_logs:str)->List[TestFailure]:
     lines=raw_logs.splitlines()
     failures:List[TestFailure]=[]
+    current_test_class=""
     i=0
     while i<len(lines):
+        class_match=_TEST_CLASS_HEADER_RE.match(lines[i])
+        if class_match:
+            current_test_class=class_match.group("class")
+            i+=1
+            continue
+
         match=_TEST_FAILURE_HEADER_RE.match(lines[i])
         if not match:
             i+=1
@@ -76,7 +87,8 @@ def extract_test_failures(raw_logs:str)->List[TestFailure]:
         qualified=match.group("qualified")
         test_class,_,test_method=qualified.rpartition(".")
         if not test_class:
-            test_class,test_method=qualified,""
+            test_class=current_test_class or qualified
+            test_method=qualified
 
         i+=1
         message_lines:List[str]=[]
@@ -105,5 +117,40 @@ def extract_test_failures(raw_logs:str)->List[TestFailure]:
 
     return failures
 
+_FALLBACK_ERROR_LINE_RE=re.compile(r"^\s*\[(?:ERROR|FATAL)\]\s*(?P<message>.+?)\s*$")
+
+_POM_FAILURE_HINTS=(
+    "pom.xml","resolve dependencies","resolve artifact","could not find artifact",
+    "non-resolvable parent pom","malformed pom","failed to read artifact descriptor",
+    "could not transfer artifact","dependencyresolutionexception","unresolvable build extension"
+)
+
+def extract_fallback_errors(raw_logs:str)->List[CompilerError]:
+    errors:List[CompilerError]=[]
+    seen:set=set()
+    for line in raw_logs.splitlines():
+        match=_FALLBACK_ERROR_LINE_RE.match(line)
+        if not match:
+            continue
+        message=match.group("message").strip()
+        if not message or message in seen:
+            continue
+        seen.add(message)
+        lower=message.lower()
+
+        file_path="pom.xml" if any(hint in lower for hint in _POM_FAILURE_HINTS) else None
+        errors.append(CompilerError(
+            file_path=file_path,
+            line_number=None,
+            column=None,
+            message=message
+        ))
+
+    return errors
+
 def parse_maven_output(raw_logs:str,container_workdir="/app")->Tuple[List[CompilerError],List[TestFailure]]:
-    return extract_compiler_errors(raw_logs,container_workdir),extract_test_failures(raw_logs)
+    compiler_errors=extract_compiler_errors(raw_logs,container_workdir)
+    failed_tests=extract_test_failures(raw_logs)
+    if not compiler_errors and not failed_tests:
+        compiler_errors=extract_fallback_errors(raw_logs)
+    return compiler_errors,failed_tests

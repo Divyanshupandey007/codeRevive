@@ -20,8 +20,8 @@ class IngestionPipeline:
         self.branch_name=branch_name
 
     @staticmethod
-    def _files_to_migrate(migration_order:List[MigrationTarget])->List[MigrationTarget]:
-        javax_targets=[t for t in migration_order if t.has_javax]
+    def _files_to_migrate(migration_order:List[MigrationTarget],target_path:Path=None)->List[MigrationTarget]:
+        targets=[t for t in migration_order if t.matched_rules]
 
         pom_target=MigrationTarget(
             identifier="pom.xml",
@@ -32,10 +32,38 @@ class IngestionPipeline:
             out_degree=0,
             is_leaf=True,
             is_test=False,
-            has_javax=False
+            has_javax=False,
+            matched_rules=["pom-migration"]
         )
 
-        return sorted(javax_targets+[pom_target],key=lambda t:t.migration_depth)
+        extra_targets:List[MigrationTarget]=[]
+        if target_path and Path(target_path).is_dir():
+            res_dir=Path(target_path)/"src"/"main"/"resources"
+            if res_dir.is_dir():
+                for p in res_dir.rglob("*"):
+                    if p.is_file() and p.suffix in (".html",".xml",".properties"):
+                        try:
+                            content=p.read_text(encoding="utf-8",errors="ignore")
+                            if "javax." in content or "javax/" in content or "#request" in content:
+                                rel=p.relative_to(target_path).as_posix()
+                                extra_targets.append(
+                                    MigrationTarget(
+                                        identifier=rel,
+                                        file_path=rel,
+                                        package_name=None,
+                                        migration_depth=0,
+                                        in_degree=0,
+                                        out_degree=0,
+                                        is_leaf=True,
+                                        is_test=False,
+                                        has_javax=True,
+                                        matched_rules=["javax-in-resource"]
+                                    )
+                                )
+                        except Exception:
+                            pass
+
+        return sorted(targets+[pom_target]+extra_targets,key=lambda t:t.migration_depth)
 
     def _repo_info_from_local_path(self,path:Path)->RepoInfo:
         try:
@@ -83,7 +111,7 @@ class IngestionPipeline:
             repo_info=repo_info,
             pom=pom,
             graph=graph,
-            files_to_migrate=self._files_to_migrate(graph.migration_order),
+            files_to_migrate=self._files_to_migrate(graph.migration_order,target_path),
             baseline_test_count=sum(m.test_count for m in manifests)
         )
 

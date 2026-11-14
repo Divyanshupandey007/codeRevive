@@ -110,16 +110,21 @@ class JavaAstParser:
 
                         check_annotation(child)
 
+                has_public_modifier=False
                 for child in node.children:
                     if child.type=="modifiers":
                         check_annotation(child)
+                        has_public_modifier=any(
+                            modifier.type=="public" for modifier in child.children
+                        )
 
                 if has_test_annotation:
                     result["test_count"]+=1
 
                 result["methods"].append({
                     "name":method_name,
-                    "is_test":has_test_annotation
+                    "is_test":has_test_annotation,
+                    "is_public":has_public_modifier
                 })
 
             for child in node.children:

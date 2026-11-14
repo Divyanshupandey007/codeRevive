@@ -19,6 +19,7 @@ class JavaClassManifest(BaseModel):
 class JavaMethodManifest(BaseModel):
     name: Optional[str] = None
     is_test:bool=False
+    is_public:bool=False
 
 class JavaFileManifest(BaseModel):
     file_path:str
@@ -39,6 +40,7 @@ class MigrationTarget(BaseModel):
     is_leaf:bool
     is_test:bool
     has_javax:bool
+    matched_rules:List[str]=Field(default_factory=list)
 
 class BlastRadiusEntry(BaseModel):
     identifier:str

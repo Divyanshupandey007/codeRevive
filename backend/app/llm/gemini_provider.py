@@ -33,30 +33,50 @@ class GeminiProvider(LLMProvider):
 
     def generate_text(self, prompt, system_instruction = None, temperature = 0.2):
         from google.genai import types
+        import time
 
-        response=self._client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature
-            )
-        )
-        return response.text or ""
+        max_retries = 4
+        for attempt in range(max_retries):
+            try:
+                response=self._client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=temperature
+                    )
+                )
+                return response.text or ""
+            except Exception as exc:
+                if attempt < max_retries - 1 and any(code in str(exc) for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise
 
     def generate_structured(self, prompt, response_schema, system_instruction = None, temperature = 0.1)->T:
         from google.genai import types
+        import time
 
-        response=self._client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=temperature,
-                response_mime_type="application/json",
-                response_schema=response_schema
-            )
-        )
+        max_retries = 4
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response=self._client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=temperature,
+                        response_mime_type="application/json",
+                        response_schema=response_schema
+                    )
+                )
+                break
+            except Exception as exc:
+                if attempt < max_retries - 1 and any(code in str(exc) for code in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"]):
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise
 
         if isinstance(response.parsed,response_schema):
             return response.parsed

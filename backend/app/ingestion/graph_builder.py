@@ -8,6 +8,7 @@ if str(backend_root) not in sys.path:
     sys.path.insert(0, str(backend_root))
 
 from app.models.manifest import BlastRadiusEntry, DependencyGraphManifest, JavaClassManifest, JavaFileManifest, MigrationTarget
+from app.ingestion.migration_rules import SPRING_BOOT_3_RULES
 
 import networkx as nx
 
@@ -51,12 +52,16 @@ class DependencyGraphBuilder:
                 node_id=f"{node_id} ({manifest.file_path})"
             seen_node_ids.add(node_id)
 
+            # Run every migration-rule predicate against the full manifest
+            matched_rules=[rule.id for rule in SPRING_BOOT_3_RULES if rule.predicate(manifest)]
+
             self.graph.add_node(
                 node_id,
                 file_path=manifest.file_path,
                 package_name=manifest.package_name,
                 has_javax=bool(manifest.javax_imports),
-                is_test=self._is_test_file(manifest.file_path)
+                is_test=self._is_test_file(manifest.file_path),
+                matched_rules=matched_rules
             )
             self._file_path_to_node[manifest.file_path]=node_id
 
@@ -176,7 +181,8 @@ class DependencyGraphBuilder:
                     out_degree=out_degree,
                     is_leaf=out_degree==0,
                     is_test=data["is_test"],
-                    has_javax=data["has_javax"]
+                    has_javax=data["has_javax"],
+                    matched_rules=data.get("matched_rules",[])
                 )
             )
 

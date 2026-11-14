@@ -18,6 +18,11 @@ class GitWorkspaceManager:
             cloned_repo=Repo.clone_from(repo_url,target_path)
         else:
             cloned_repo=Repo(target_path)
+            try:
+                cloned_repo.git.reset("--hard")
+                cloned_repo.git.clean("-fd")
+            except Exception:
+                pass
 
         baseline_sha=cloned_repo.head.commit.hexsha
 
