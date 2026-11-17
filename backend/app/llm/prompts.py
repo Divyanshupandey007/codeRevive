@@ -1,10 +1,4 @@
-from pathlib import Path
-import sys
 from typing import List, Optional
-
-backend_root=Path(__file__).resolve().parents[2]
-if str(backend_root) not in sys.path:
-    sys.path.insert(0,str(backend_root))
 
 from app.models.execution import CompilerError, TestFailure
 
@@ -16,12 +10,19 @@ CODER_AGENT_SYSTEM_INSTRUCTION=(
     "1. Never delete or weaken existing business logic. Only change what the "
     "migration rule below explicitly asks for.\n"
     "2. Never remove an @Test annotation, a test method, or test assertions.\n"
-    "3. Only migrate the Java packages/dependencies specified in the task - "
-    "leave every other import, annotation, and line of code untouched.\n"
+    "3. Only migrate the Java packages/dependencies and repair diagnostics specified "
+    "in the task - leave every other import, annotation, and line of code untouched.\n"
     "4. Return the ENTIRE updated file content, not a diff, a snippet, or an "
     "excerpt - the caller writes new_content directly to disk as the whole file.\n"
     "5. Never wrap new_content in markdown code fences (```java, ```) - it must "
-    "be raw source code, nothing else."
+    "be raw source code, nothing else.\n"
+    "6. Preserve multi-line Java formatting with real newline characters (\\n) "
+    "between package declarations, imports, annotations, fields, and methods. "
+    "Never collapse a file onto a single line or concatenate annotations with "
+    "modifiers (e.g. keep '@Autowired' and 'private' on separate lines).\n"
+    "7. Preserve every backslash inside Java string literals and regexes when "
+    "encoding JSON (e.g., write '\\\\\\\\s', '\\\\\\\\S', '\\\\\\\\d', '\\\\\\\\/' "
+    "in JSON so decoded Java keeps '\\\\s', '\\\\S', '\\\\d', '\\\\/')."
 )
 
 def _format_diagnostics(compiler_errors:List[CompilerError],failed_tests:List[TestFailure])->str:
@@ -34,12 +35,144 @@ def _format_diagnostics(compiler_errors:List[CompilerError],failed_tests:List[Te
 
     return "\n".join(lines)
 
+def _format_error_line_snippets(
+        source_code:str,compiler_errors:List[CompilerError],max_snippets:int=8
+)->str:
+    lines=source_code.splitlines()
+    if not lines or not compiler_errors:
+        return ""
+    snippets:List[str]=[]
+    seen_lines=set()
+    for error in compiler_errors:
+        if error.line_number is None or error.line_number<1 or error.line_number>len(lines):
+            continue
+        if error.line_number in seen_lines:
+            continue
+        seen_lines.add(error.line_number)
+        idx=error.line_number-1
+        start=max(0,idx-2)
+        end=min(len(lines),idx+3)
+        block=[f"--- line {error.line_number}"+(f" (col {error.column})" if error.column else "")+f": {error.message}"]
+        for li in range(start,end):
+            marker=">" if li==idx else " "
+            block.append(f"{marker} {li+1:4d}: {lines[li]}")
+            if li==idx and error.column and error.column>0:
+                col_offset=min(max(error.column-1,0),len(lines[li]))
+                block.append(f"        {' '*col_offset}^")
+        snippets.append("\n".join(block))
+        if len(snippets)>=max_snippets:
+            break
+    if not snippets:
+        return ""
+    return "Exact failing source line(s):\n```text\n"+"\n".join(snippets)+"\n```"
+
+
+def _build_compiler_repair_hints(compiler_errors:List[CompilerError])->str:
+    if not compiler_errors:
+        return ""
+    notes:List[str]=[]
+    messages=[e.message for e in compiler_errors if e.message]
+    lower_msgs=[m.lower() for m in messages]
+
+    if any("illegal escape character" in m for m in lower_msgs):
+        notes.append(
+            "Note on 'illegal escape character': In Java string literals, regex/path "
+            "escapes must be written with double backslashes ('\\\\s', '\\\\S', '\\\\/'), "
+            "which requires quadruple backslashes ('\\\\\\\\') inside JSON output."
+        )
+
+    if any(
+        (
+            "cannot be converted to java.lang.string" in m
+            and ("predicate" in m or "criterion" in m)
+        )
+        or (
+            ("no suitable method found" in m or "cannot be applied to given types" in m)
+            and ("predicate" in m or "pagerequest" in m)
+        )
+        or "conforms to java.util.list<jakarta.persistence.criteria.predicate>" in m
+        for m in lower_msgs
+    ):
+        notes.append(
+            "Note on Criteria/Predicate argument type mismatch:\n"
+            "- `Predicate[]` (or `Predicate...` varargs) CANNOT be passed to an HQL method "
+            "expecting `String` (such as `find(String hql, Object...)` or `findPage(Page, String hql, Object...)`).\n"
+            "- Multiple varargs `(Predicate, Predicate, ...)` CANNOT be passed directly to a method expecting "
+            "`List<Predicate>`; wrap them in `Arrays.asList(...)` or `List.of(...)` and match EVERY parameter type "
+            "(for example `PageRequest` vs `Page`) declared in `Updated local project dependencies`.\n"
+            "- If the DAO / dependency interface has no `Predicate` or `List<Predicate>` overload for this operation "
+            "(or this class must keep a `Predicate...` method contract while the DAO only exposes `List<Predicate>` or HQL), "
+            "either adapt via `Arrays.asList(...)` to the exact DAO method in `Updated local project dependencies`, "
+            "rewrite the call using HQL if `find(String hql, Object...)` is available (removing any now-unused `Predicate` variables), "
+            "or execute the query directly via `getSession()` / `EntityManager` using JPA `CriteriaBuilder cb = session.getCriteriaBuilder()`, "
+            "`CriteriaQuery<T> cq = cb.createQuery(...)`, `Root<T> root = cq.from(...)`, and `cq.where(...)`."
+        )
+
+    if any("method root(" in m and "criteriabuilder" in m for m in lower_msgs):
+        notes.append(
+            "Note on `CriteriaBuilder.root(...)`: `CriteriaBuilder` and `HibernateCriteriaBuilder` "
+            "do NOT have a `.root(Class)` method. Create a `CriteriaQuery<T> cq = cb.createQuery(Entity.class)` "
+            "first and obtain the root with `Root<T> root = cq.from(Entity.class)`."
+        )
+
+    if any(
+        ("tags()" in m and "tag" in m)
+        or "missing a default value for the element 'name'" in m
+        or "annotation type not applicable to this kind of declaration" in m
+        or "apiignore" in m
+        for m in lower_msgs
+    ):
+        notes.append(
+            "Note on SpringDoc / OpenAPI 3 annotations:\n"
+            "- `@io.swagger.v3.oas.annotations.tags.Tag` uses `name = \"...\"` (NEVER `tags = \"...\"` or `value = \"...\"`).\n"
+            "- `@io.swagger.v3.oas.annotations.Hidden` is ONLY valid on classes (`TYPE`) and methods (`METHOD`), "
+            "NEVER on method parameters! Putting `@Hidden` on a parameter causes `annotation type not applicable to this kind of declaration`. "
+            "Replace `@ApiIgnore` on method parameters with `@io.swagger.v3.oas.annotations.Parameter(hidden = true)` (or omit it), "
+            "and use `@Hidden` only on classes or methods."
+        )
+
+    if any(
+        "list<java.lang.object[]> cannot be converted to java.util.list<t>" in m
+        or "inference variable r has incompatible equality constraints" in m
+        for m in lower_msgs
+    ):
+        notes.append(
+            "Note on Hibernate 6 Query generic return type mismatch:\n"
+            "- In Hibernate 6, `session.createQuery(hql)` returns `Query<Object>` (or `List<Object[]>` when selecting columns), "
+            "which can clash with `<T>` or `<R>` return inference. Use `session.createQuery(hql, entityClass)` when returning entities, "
+            "align `CriteriaQuery<T>` with the declared return type, or cast explicitly with `@SuppressWarnings(\"unchecked\") (List<T>)`."
+        )
+
+    if any(
+        "org.apache.hc." in m
+        or "closeexpiredconnections" in m
+        or "stringentity" in m
+        or "releaseconnection" in m
+        for m in lower_msgs
+    ):
+        notes.append(
+            "Note on Apache HttpClient 5 (if used in this repo):\n"
+            "- `HttpClientConnectionManager`: use `org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager` "
+            "(or `ConnPoolControl` / `closeExpired()` & `closeIdle(TimeValue)` on pooling manager; `HttpClientConnectionManager` itself no longer exposes `closeExpiredConnections()`).\n"
+            "- `HttpGet`/`HttpPost`/`HttpDelete`/`HttpPatch`: `getURI()` -> `getUri()`, `getAllHeaders()` -> `getHeaders()`, `releaseConnection()` -> `reset()` (or try-with-resources).\n"
+            "- `StringEntity`: `new StringEntity(body, ContentType.create(\"application/json\", StandardCharsets.UTF_8))` or `new StringEntity(body, StandardCharsets.UTF_8)` (do not pass a `String` charset or call removed `setContentType`/`setContentEncoding`).\n"
+            "- Multipart: `org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder` lives in `httpclient5`, not `org.apache.hc.core5.http.io.entity.mime`."
+        )
+
+    if not notes:
+        return ""
+    return "\n"+"\n".join(notes)
+
+
 def build_coder_prompt(
         target_file_path:str,
         source_code:str,
         migration_rule:str,
         compiler_errors:Optional[List[CompilerError]]=None,
-        failed_tests:Optional[List[TestFailure]]=None
+        failed_tests:Optional[List[TestFailure]]=None,
+        runtime_log_excerpt:Optional[str]=None,
+        migration_context:Optional[str]=None,
+        dependency_context:Optional[str]=None,
 )->str:
     sections=[
         f"Target file: {target_file_path}",
@@ -47,14 +180,35 @@ def build_coder_prompt(
         f"Current source_code:\n```java\n{source_code}\n```"
     ]
 
+    if dependency_context:
+        sections.append(
+            "Updated local project dependencies (align overrides, implemented methods, "
+            "and calls with these exact current signatures):\n"
+            f"{dependency_context}"
+        )
+
+    if migration_context:
+        sections.append(f"Repair context: {migration_context}")
+
     if compiler_errors or failed_tests:
         diagnostics=_format_diagnostics(compiler_errors or [],failed_tests or [])
+        line_snippets=_format_error_line_snippets(source_code,compiler_errors or [])
+        repair_hints=_build_compiler_repair_hints(compiler_errors or [])
+        snippet_section=f"\n\n{line_snippets}" if line_snippets else ""
         sections.append(
             "This is a REPAIR attempt: the previous patch to this file produced "
-            "the diagnostics below when built in the sandbox. Fix them without "
-            "violating the migration rule or any rule in the system instruction:\n"
+            "the diagnostics below when built in the sandbox. You MUST fix all "
+            "reported compiler errors and test failures (including moved package "
+            "imports, removed transitive dependencies, or updated API signatures) "
+            "while preserving existing business logic, public method contracts, "
+            "and @Test assertions:\n"
+            f"{diagnostics}{snippet_section}{repair_hints}"
+        )
 
-            f"{diagnostics}"
+    if runtime_log_excerpt:
+        sections.append(
+            "[SERVER / RUNTIME LOG EXCERPT]\n"
+            f"{runtime_log_excerpt}"
         )
 
     return "\n\n".join(sections)

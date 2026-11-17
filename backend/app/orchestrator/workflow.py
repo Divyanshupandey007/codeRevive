@@ -1,112 +1,155 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-import sys
+import re
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
-backend_root=Path(__file__).resolve().parents[2]
-if str(backend_root) not in sys.path:
-    sys.path.insert(0,str(backend_root))
-
-from app.ingestion.migration_rules import SPRING_BOOT_3_RULES
-from app.guardrails.post_execution import PostExecutionIntegrityResult, run_post_execution_integrity
+from app.config import settings
+from app.guardrails.post_execution import (
+    PostExecutionIntegrityResult,
+    run_post_execution_integrity,
+)
 from app.guardrails.pre_execution import SecurityViolationError
 from app.ingestion.ast_parser import JavaAstParser
-from app.ingestion.patch_applicator import apply_patch, commit_patch, rollback_patch
+from app.ingestion.migration_planner import (
+    build_migration_plan,
+    render_pom_migration_instruction,
+    render_resource_migration_instruction,
+)
+from app.ingestion.migration_rules import SPRING_BOOT_3_RULES
+from app.ingestion.openrewrite_runner import (
+    OpenRewriteExecutionResult,
+    OpenRewriteRunner,
+)
+from app.ingestion.patch_applicator import (
+    apply_patch_with_diff,
+    commit_patch,
+)
 from app.llm.base import LLMProvider, LLMProviderError
 from app.llm.factory import LLMFactory
 from app.llm.prompts import CODER_AGENT_SYSTEM_INSTRUCTION, build_coder_prompt
 from app.models.agent import FilePatchResult
 from app.models.execution import BuildResult, CompilerError, TestFailure
-from app.models.manifest import MigrationTarget, ProjectIngestionReport
-from app.models.orchestrator import FileMigrationStatus, FileStatus, MigrationRunSummary, WorkflowState
-from app.sandbox.docker_runner import ContainerExecutionError, DockerRunner
-
-
-POM_MIGRATION_RULE=(
-    "Upgrade this Maven pom.xml for a Spring Boot 2 -> 3 / Java 17 migration: "
-    "(1) change the spring-boot-starter-parent <parent> version from 2.7.0 to "
-    "3.0.2 (or the latest available 3.0.x release), (2) set the <java.version> "
-    "property to 17, (3) update the mybatis-spring-boot-starter dependency "
-    "version from 2.2.2 to 3.0.1 (the Spring Boot 3-compatible release), and also DELETE the "
-    "<thymeleaf.version>3.0.14.RELEASE</thymeleaf.version> property override so the "
-    "Boot 3 BOM manages Thymeleaf 3.0.15.RELEASE (thymeleaf-spring6 3.0.14.RELEASE does "
-    "not exist on Maven Central and fails dependency resolution). "
-    "(4) remove the <repositories>/<pluginRepositories> entries pointing at https://repo.spring.io/... (they return 401 and break dependency resolution; all"
-    "needed artifacts are on Maven Central), (5) rename thymeleaf-extras-springsecurity5 to thymeleaf-extras-springsecurity6 (the Boot 3 artifact)," 
-    "(6) remove the <maven.compiler.source/target>1.8</...> properties (or set them to 17) since Boot 3 requires Java 17 bytecode, "
-    "(7) update the <selenide.version> property from 6.6.1 to 6.19.1 and DELETE the <selenium.version>4.1.0</selenium.version> property override so the Boot 3 BOM manages Selenium. "
-    "Do not change any other dependency, plugin, or property." 
+from app.models.manifest import (
+    JavaFileManifest,
+    MigrationPlan,
+    MigrationTarget,
+    ProjectIngestionReport,
 )
-
-POM_COMMIT_SUMMARY="spring-boot 2.7.0 -> 3.0.2, java -> 17, mybatis-spring-boot-starter -> 3.0.1, selenide -> 6.19.1"
-
-JAVAX_VALIDATION_MIGRATION_RULE=(
-    "Migrate all javax.validation.* imports and annotations in this file to "
-    "their jakarta.validation.* equivalents. Do not change anything else "
-    "about this file."
+from app.models.orchestrator import (
+    FileMigrationStatus,
+    FileStatus,
+    MigrationRunSummary,
+    WorkflowState,
 )
+from app.orchestrator.dependency_context import (
+    build_local_dep_lookup,
+    collect_dependency_context,
+    expand_type_ancestors,
+    parse_manifest_cached,
+)
+from app.orchestrator.java_patch_utils import (
+    repair_illegal_java_string_escapes as _repair_illegal_java_string_escapes,
+    restore_stripped_java_backslashes as _restore_stripped_java_backslashes,
+    validate_java_api_sanity as _validate_java_api_sanity,
+    validate_multiline_java_formatting as _validate_multiline_java_formatting,
+)
+from app.orchestrator.repair_heuristics import (
+    app_candidate_priority,
+    extract_implicated_bean_stems,
+    extract_runtime_log_excerpt,
+    is_pure_cascading_override_failure,
+    looks_like_app_runtime_failure,
+    resolve_sandbox_db_fallback_args,
+)
+from app.sandbox.diagnostics_parser import (
+    classify_build_failure,
+    is_database_environment_failure,
+)
+from app.sandbox.docker_runner import DockerRunner
+from app.sandbox.service_detector import ServiceRequirement, detect_required_services
 
-JAVAX_VALIDATION_COMMIT_SUMMARY="javax.validation -> jakarta.validation"
-
-GENERIC_SPRING_BOOT_3_RULE=(
+GENERIC_SPRING_BOOT_3_RULE = (
     "This file needs to be updated for Spring Boot 3 compatibility. "
     "Examine the file for any Spring Boot 2.x-era APIs, deprecated classes, "
-    "or removed patterns (javax.* -> jakarta.*, removed adapter superclasses, "
+    "or removed patterns (Jakarta EE javax.* -> jakarta.*, removed adapter superclasses, "
     "renamed packages) and apply the necessary changes. "
-    "Do not change any business logic."
+    "Do not change Java SE javax.* packages (e.g., javax.sql.*, javax.crypto.*) "
+    "or unrelated business logic."
 )
 
-LAYOUT_HTML_MIGRATION_RULE=(
-    "In Thymeleaf 3.1 and Spring Boot 3, the #request object was removed from Thymeleaf expressions, "
-    "and javax.servlet was renamed to jakarta.servlet. "
-    "Replace <body th:with=\"isErrorResponse=${#request.getAttribute('javax.servlet.error.status_code') ge 400}\"> "
-    "with <body th:with=\"isErrorResponse=${status != null and status ge 400}\">. "
-    "Do not change any other part of the file."
-)
 
-LAYOUT_HTML_COMMIT_SUMMARY="javax.servlet -> jakarta.servlet, Thymeleaf 3.1 #request removal"
+def _migration_spec_for(
+    target_file_path: str,
+    matched_rules: List[str],
+    plan: MigrationPlan,
+    file_content: str = "",
+) -> Tuple[str, str]:
+    if Path(target_file_path).name == "pom.xml":
+        return (
+            render_pom_migration_instruction(plan),
+            f"upgrade pom.xml to Spring Boot {plan.target_spring_boot} / Java {plan.target_java}",
+        )
 
-def _migration_spec_for(target_file_path:str,matched_rules:List[str])->Tuple[str,str]:
-    if Path(target_file_path).name=="pom.xml":
-        return POM_MIGRATION_RULE,POM_COMMIT_SUMMARY
+    if "resource-migration" in matched_rules or Path(target_file_path).suffix.lower() in (
+        ".html",
+        ".xhtml",
+        ".yml",
+        ".yaml",
+        ".properties",
+        ".xml",
+    ):
+        return (
+            render_resource_migration_instruction(target_file_path, file_content),
+            "Spring Boot 3 resource/template compatibility",
+        )
 
-    if "javax-in-resource" in matched_rules or Path(target_file_path).suffix in (".html",".xhtml"):
-        return LAYOUT_HTML_MIGRATION_RULE,LAYOUT_HTML_COMMIT_SUMMARY
-
-    rules=[r for r in SPRING_BOOT_3_RULES if r.id in matched_rules]
+    rules = [r for r in SPRING_BOOT_3_RULES if r.id in matched_rules]
     if not rules:
         return GENERIC_SPRING_BOOT_3_RULE, "Spring Boot 3 migration"
 
-    instruction="\n\n".join(r.migration_instruction for r in rules)
-    summary="; ".join(r.commit_summary for r in rules)
-    return instruction,summary
+    instruction = "\n\n".join(r.migration_instruction for r in rules)
+    summary = "; ".join(r.commit_summary for r in rules)
+    return instruction, summary
 
-def _diagnostics_summary(compiler_errors:List[CompilerError],failed_tests:List[TestFailure])->List[str]:
-    summary=[f"{e.file_path}:{e.line_number}:{e.column} {e.message}" if e.line_number is not None else f"{e.file_path or '(unattributed)'}" for e in compiler_errors]
-    summary+=[f"{t.test_class}:{t.test_method}: {t.failure_message}" for t in failed_tests]
+
+def _diagnostics_summary(
+    compiler_errors: List[CompilerError], failed_tests: List[TestFailure]
+) -> List[str]:
+    summary = [
+        f"{e.file_path}:{e.line_number}:{e.column} {e.message}"
+        if e.line_number is not None
+        else f"{e.file_path or '(unattributed)'}: {e.message}"
+        for e in compiler_errors
+    ]
+    summary += [
+        f"{t.test_class}:{t.test_method}: {t.failure_message}" for t in failed_tests
+    ]
     return summary
 
-def _group_diagnostics_by_target(
-        compiler_errors:List[CompilerError],
-        failed_tests:List[TestFailure],
-        target_file_paths:Set[str],
-        identifier_to_file:Dict[str,str]
-)->Dict[str,Tuple[List[CompilerError],List[TestFailure]]]:
-    grouped:Dict[str,Tuple[List[CompilerError],List[TestFailure]]]={}
 
-    def _bucket(file_path:str)->Tuple[List[CompilerError],List[TestFailure]]:
-        return grouped.setdefault(file_path,([],[]))
+def _group_diagnostics_by_target(
+    compiler_errors: List[CompilerError],
+    failed_tests: List[TestFailure],
+    target_file_paths: Set[str],
+    identifier_to_file: Dict[str, str],
+) -> Dict[str, Tuple[List[CompilerError], List[TestFailure]]]:
+    grouped: Dict[str, Tuple[List[CompilerError], List[TestFailure]]] = {}
+
+    def _bucket(file_path: str) -> Tuple[List[CompilerError], List[TestFailure]]:
+        return grouped.setdefault(file_path, ([], []))
 
     for error in compiler_errors:
         if error.file_path and error.file_path in target_file_paths:
             _bucket(error.file_path)[0].append(error)
 
     for failure in failed_tests:
-        matched_file=None
-        for identifier,file_path in identifier_to_file.items():
-            if identifier==failure.test_class or identifier.endswith(f".{failure.test_class}"):
-                matched_file=file_path
+        matched_file = None
+        for identifier, file_path in identifier_to_file.items():
+            if identifier == failure.test_class or identifier.endswith(
+                f".{failure.test_class}"
+            ):
+                matched_file = file_path
                 break
 
         if matched_file and matched_file in target_file_paths:
@@ -114,125 +157,483 @@ def _group_diagnostics_by_target(
 
     return grouped
 
+
+def _order_actionable_ancestors_first(
+    ordered_items: List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]],
+    ancestors_by_path: Dict[str, Set[str]],
+) -> List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]]:
+    """Order actionable files so parent interfaces/superclasses run before subclasses in the same round."""
+    if len(ordered_items) <= 1:
+        return ordered_items
+
+    index_by_path = {fp: idx for idx, (fp, _) in enumerate(ordered_items)}
+    dependents: Dict[str, List[str]] = {fp: [] for fp, _ in ordered_items}
+    indegree: Dict[str, int] = {fp: 0 for fp, _ in ordered_items}
+
+    for fp, _ in ordered_items:
+        for anc in ancestors_by_path.get(fp, ()):
+            if anc in index_by_path and anc != fp:
+                dependents[anc].append(fp)
+                indegree[fp] += 1
+
+    ready = sorted(
+        (fp for fp, deg in indegree.items() if deg == 0),
+        key=lambda fp: index_by_path[fp],
+    )
+    item_by_path = dict(ordered_items)
+    ordered_paths: List[str] = []
+    seen: Set[str] = set()
+
+    while ready:
+        cur = ready.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+        ordered_paths.append(cur)
+        for child in dependents[cur]:
+            indegree[child] -= 1
+            if indegree[child] == 0 and child not in seen:
+                ready.append(child)
+        ready.sort(key=lambda fp: index_by_path[fp])
+
+    if len(ordered_paths) < len(ordered_items):
+        for fp, _ in ordered_items:
+            if fp not in seen:
+                ordered_paths.append(fp)
+
+    return [(fp, item_by_path[fp]) for fp in ordered_paths]
+
+
 @dataclass
 class _FileWorkItem:
-    target:MigrationTarget
-    migration_rule:str
-    commit_summary:str
-    attempts:int=0
-    errors_encountered:List[str]=field(default_factory=list)
-    skipped:bool=False
+    target: MigrationTarget
+    migration_rule: str
+    commit_summary: str
+    state: FileStatus = FileStatus.PENDING
+    applied_by: Optional[str] = None
+    attempts: int = 0
+    diff: Optional[str] = None
+    errors_encountered: List[str] = field(default_factory=list)
+    prev_compiler_signatures: Set[str] = field(default_factory=set)
+
 
 class MigrationOrchestrator:
     def __init__(
-            self,
-            repo_path:Path,
-            llm_provider:Optional[LLMProvider]=None,
-            docker_runner:Optional[DockerRunner]=None,
-            retry_budget:int=3,
-            maven_args:Optional[List[str]]=None
+        self,
+        repo_path: Path,
+        llm_provider: Optional[LLMProvider] = None,
+        docker_runner: Optional[DockerRunner] = None,
+        openrewrite_runner: Optional[OpenRewriteRunner] = None,
+        retry_budget: Optional[int] = None,
+        maven_args: Optional[List[str]] = None,
+        use_openrewrite: Optional[bool] = None,
+        openrewrite_mode: Optional[str] = None,
     ):
-        self.repo_path=Path(repo_path)
-        self.llm_provider=llm_provider or LLMFactory.create()
-        self.docker_runner=docker_runner or DockerRunner()
-        self.retry_budget=retry_budget
-        self.maven_args=maven_args
-        self.state=WorkflowState.INITIALIZING
+        self.repo_path = Path(repo_path)
+        self._llm_provider = llm_provider
+        self.docker_runner = docker_runner or DockerRunner()
+        self.use_openrewrite = (
+            settings.use_openrewrite if use_openrewrite is None else use_openrewrite
+        )
+        self.openrewrite_runner = openrewrite_runner or OpenRewriteRunner(
+            executor=self.docker_runner if hasattr(self.docker_runner, "run_maven_rewrite") else None,
+            allow_deterministic_fallback=True,
+            mode=openrewrite_mode,
+        )
+        self.retry_budget = (
+            settings.default_retry_budget if retry_budget is None else retry_budget
+        )
+        self.maven_args = maven_args
+        self.state = WorkflowState.INITIALIZING
+        self._ast_parser: Optional[JavaAstParser] = None
+        self._manifest_cache: Dict[str, Optional[JavaFileManifest]] = {}
 
-    def _transition(self,new_state:WorkflowState)->None:
-        print(f"[orchestrator] {self.state.value} -> {new_state.value}")
-        self.state=new_state
+    @property
+    def ast_parser(self) -> JavaAstParser:
+        if self._ast_parser is None:
+            self._ast_parser = JavaAstParser(str(self.repo_path))
+        return self._ast_parser
+
+    @property
+    def llm_provider(self) -> LLMProvider:
+        if self._llm_provider is None:
+            self._llm_provider = LLMFactory.create()
+        return self._llm_provider
+
+    def _transition(self, new_state: WorkflowState) -> None:
+        if self.state != new_state:
+            print(f"[orchestrator] {self.state.value} -> {new_state.value}")
+        self.state = new_state
+
+    def _request_patch_and_restore(
+        self, prompt: str, target_file_path: str, source_code: str
+    ) -> Tuple[FilePatchResult, Optional[str]]:
+        patch = self.llm_provider.generate_structured(
+            prompt=prompt,
+            response_schema=FilePatchResult,
+            system_instruction=CODER_AGENT_SYSTEM_INSTRUCTION,
+        )
+        patch.new_content = _restore_stripped_java_backslashes(
+            target_file_path, source_code, patch.new_content
+        )
+        fmt_error = _validate_multiline_java_formatting(
+            target_file_path, source_code, patch.new_content
+        )
+        return patch, fmt_error
+
+    def _request_validated_patch(
+        self,
+        prompt: str,
+        target_file_path: str,
+        source_code: str,
+        migration_rule: str,
+        illegal_escape_lines: Optional[Set[int]] = None,
+    ) -> FilePatchResult:
+        patch, fmt_error = self._request_patch_and_restore(
+            prompt, target_file_path, source_code
+        )
+        if fmt_error:
+            print(f" [FORMAT RETRY] {target_file_path}: {fmt_error}")
+            retry_prompt = (
+                f"{prompt}\n\nCRITICAL FORMATTING CORRECTION: {fmt_error} "
+                "Return the complete file with proper multi-line formatting and real '\\n' "
+                "line breaks between every import, annotation, field, and method."
+            )
+            patch, fmt_error = self._request_patch_and_restore(
+                retry_prompt, target_file_path, source_code
+            )
+            if fmt_error:
+                raise SecurityViolationError(
+                    f"Patch formatting validation failed after retry: {fmt_error}"
+                )
+
+        api_sanity_error = _validate_java_api_sanity(
+            target_file_path, migration_rule, patch.new_content
+        )
+        if api_sanity_error:
+            print(f" [API SANITY RETRY] {target_file_path}: {api_sanity_error}")
+            sanity_prompt = (
+                f"{prompt}\n\nCRITICAL API CORRECTION: {api_sanity_error} "
+                "Update the entire file to fix this issue while preserving all business logic and method contracts."
+            )
+            patch, fmt_error = self._request_patch_and_restore(
+                sanity_prompt, target_file_path, source_code
+            )
+            if fmt_error:
+                raise SecurityViolationError(
+                    f"Patch formatting validation failed after API sanity retry: {fmt_error}"
+                )
+
+        if target_file_path.endswith(".java") and illegal_escape_lines:
+            patch.new_content = _repair_illegal_java_string_escapes(
+                patch.new_content, target_lines=illegal_escape_lines
+            )
+        return patch
 
     def generate_patch(
-            self,
-            target_file_path:str,
-            source_code:str,
-            migration_rule:str,
-            compiler_errors:List[CompilerError],
-            failed_tests:List[TestFailure]
-    )->FilePatchResult:
+        self,
+        target_file_path: str,
+        source_code: str,
+        migration_rule: str,
+        compiler_errors: List[CompilerError],
+        failed_tests: List[TestFailure],
+        runtime_log_excerpt: Optional[str] = None,
+        migration_context: Optional[str] = None,
+        dependency_context: Optional[str] = None,
+    ) -> FilePatchResult:
         self._transition(WorkflowState.GENERATING_PATCH)
-        prompt=build_coder_prompt(
+        prompt = build_coder_prompt(
             target_file_path=target_file_path,
             source_code=source_code,
             migration_rule=migration_rule,
             compiler_errors=compiler_errors or None,
-            failed_tests=failed_tests or None
+            failed_tests=failed_tests or None,
+            runtime_log_excerpt=runtime_log_excerpt,
+            migration_context=migration_context,
+            dependency_context=dependency_context,
         )
-        return self.llm_provider.generate_structured(
-            prompt=prompt,
-            response_schema=FilePatchResult,
-            system_instruction=CODER_AGENT_SYSTEM_INSTRUCTION
+        illegal_escape_lines = {
+            e.line_number
+            for e in (compiler_errors or [])
+            if e.line_number is not None
+            and "illegal escape character" in e.message.lower()
+        }
+        patch = self._request_validated_patch(
+            prompt,
+            target_file_path,
+            source_code,
+            migration_rule,
+            illegal_escape_lines=illegal_escape_lines,
         )
 
-    def _verify_in_sandbox(self):
+        if (compiler_errors or failed_tests) and (
+            (patch.new_content or "").strip() == source_code.strip()
+        ):
+            print(
+                f" [NO-OP RETRY] {target_file_path}: LLM returned unchanged code despite active diagnostics; retrying"
+            )
+            noop_prompt = (
+                f"{prompt}\n\nCRITICAL NO-OP CORRECTION: Your previous response returned "
+                f"'{target_file_path}' completely unchanged (zero diff), leaving all reported "
+                "compiler error(s) / test failure(s) unfixed. You MUST modify the failing line(s) "
+                "shown in the diagnostics above so the code compiles and passes tests cleanly."
+            )
+            patch = self._request_validated_patch(
+                noop_prompt,
+                target_file_path,
+                source_code,
+                migration_rule,
+                illegal_escape_lines=illegal_escape_lines,
+            )
+        return patch
+
+    def _verify_in_sandbox(
+        self,
+        maven_args: Optional[List[str]] = None,
+        services: Optional[List[ServiceRequirement]] = None,
+    ) -> BuildResult:
         self._transition(WorkflowState.VERIFYING_SANDBOX)
-        return self.docker_runner.run_tests(self.repo_path,self.maven_args)
+        effective_args = self.maven_args if maven_args is None else maven_args
+        if services is not None:
+            return self.docker_runner.run_tests(
+                self.repo_path, effective_args, services=services
+            )
+        return self.docker_runner.run_tests(self.repo_path, effective_args)
 
-    def _rollback_all(self)->None:
-        from git import Repo
-        repo=Repo(self.repo_path)
-        repo.git.reset("--hard")
-        repo.git.clean("-fd")
+    def _rollback_all(self) -> None:
+        try:
+            from git import InvalidGitRepositoryError, Repo
 
-    def _current_head_sha(self)->Optional[str]:
+            repo = Repo(self.repo_path)
+            repo.git.reset("--hard")
+            repo.git.clean("-fd")
+        except InvalidGitRepositoryError:
+            return
+
+    def _current_head_sha(self) -> Optional[str]:
         try:
             from git import Repo
+
             return Repo(self.repo_path).head.commit.hexsha
         except Exception:
             return None
 
-    """Pass 1 - Synchronized Transformation (no Docker):
-        Every target file (pom.xml first, then each javax.validation user)
-        gets exactly one LLM pass with no diagnostics, so pom.xml and every
-        Java file move to the new namespace together."""
-    def _pass1_transform(self,target:MigrationTarget)->_FileWorkItem:
-        self._transition(WorkflowState.MIGRATING_FILE)
-        migration_rule,commit_summary=_migration_spec_for(target.file_path,target.matched_rules)
-        record=_FileWorkItem(target=target,migration_rule=migration_rule,commit_summary=commit_summary)
-        target_file=self.repo_path/target.file_path
+    def _run_openrewrite_pass(
+        self,
+        plan: MigrationPlan,
+        graph_targets_by_path: Dict[str, MigrationTarget],
+        file_records: Dict[str, _FileWorkItem],
+        modified_files: Set[str],
+    ) -> Optional[OpenRewriteExecutionResult]:
+        if not self.use_openrewrite:
+            return None
+
+        self._transition(WorkflowState.OPENREWRITE_PASS)
+        result = self.openrewrite_runner.run(self.repo_path, plan)
+        if result.executed:
+            for file_path in result.modified_files:
+                abs_file = self.repo_path / file_path
+                if not abs_file.is_file():
+                    continue
+                known = graph_targets_by_path.get(file_path)
+                matched_rules = list(known.matched_rules) if known else []
+                content = abs_file.read_text(encoding="utf-8", errors="ignore")
+                rule, summary = _migration_spec_for(file_path, matched_rules, plan, content)
+                target = known or MigrationTarget(
+                    identifier=file_path,
+                    file_path=file_path,
+                    package_name=None,
+                    migration_depth=0,
+                    in_degree=0,
+                    out_degree=0,
+                    is_leaf=True,
+                    is_test="/src/test/" in f"/{file_path}",
+                    has_javax=False,
+                    matched_rules=matched_rules,
+                )
+                file_records[file_path] = _FileWorkItem(
+                    target=target,
+                    migration_rule=rule,
+                    commit_summary=summary,
+                    state=FileStatus.PATCH_APPLIED,
+                    applied_by="openrewrite",
+                    attempts=1,
+                    diff=result.diffs.get(file_path),
+                )
+                modified_files.add(file_path)
+                print(f" [OPENREWRITE] {file_path} ({summary})")
+
+            post_or_manifests = self.ast_parser.parse_repo()
+            self._manifest_cache = {m.file_path: m for m in post_or_manifests}
+        if result.error:
+            print(
+                f" [OPENREWRITE NOTICE] {result.error}; "
+                "Pass 2 will verify the build and use AI to resolve any errors."
+            )
+        return result
+
+    def _ensure_work_item(
+        self,
+        file_path: str,
+        file_records: Dict[str, _FileWorkItem],
+        target_file_paths: Set[str],
+        identifier_to_file: Dict[str, str],
+        plan: MigrationPlan,
+        graph_targets_by_path: Optional[Dict[str, MigrationTarget]],
+        is_test: bool = False,
+    ) -> Optional[_FileWorkItem]:
+        if file_path in file_records:
+            return file_records[file_path]
+        target_file = self.repo_path / file_path
         if not target_file.is_file():
-            record.skipped=True
-            record.errors_encountered=[f"File not found in workspace: {target_file}"]
-            print(f" [SKIP] {target.file_path}: not found in workspace")
-            return record
+            return None
 
-        record.attempts=1
-        source_code=target_file.read_text(encoding="utf-8")
+        target_file_paths.add(file_path)
+        identifier_to_file.setdefault(file_path, file_path)
+        known_target = (
+            graph_targets_by_path.get(file_path)
+            if graph_targets_by_path
+            else None
+        )
+        matched_rules = list(known_target.matched_rules) if known_target else []
+        rule, summary = _migration_spec_for(
+            file_path,
+            matched_rules,
+            plan,
+            target_file.read_text(encoding="utf-8", errors="ignore"),
+        )
+        target = known_target or MigrationTarget(
+            identifier=file_path,
+            file_path=file_path,
+            package_name=None,
+            migration_depth=0,
+            in_degree=0,
+            out_degree=0,
+            is_leaf=True,
+            is_test=is_test or ("/src/test/" in f"/{file_path}"),
+            has_javax=False,
+            matched_rules=matched_rules,
+        )
+        item = _FileWorkItem(
+            target=target,
+            migration_rule=rule,
+            commit_summary=summary,
+            state=FileStatus.PENDING,
+        )
+        file_records[file_path] = item
+        return item
 
-        try:
-            patch=self.generate_patch(target.file_path,source_code,migration_rule,[],[])
-        except LLMProviderError as exc:
-            record.errors_encountered=[f"LLM generation failed: {exc}"]
-            print(f" [PASS1 REJECTED] {target.file_path}: {exc}")
-            return record
+    def _discover_missing_targets(
+        self,
+        build_result: BuildResult,
+        target_file_paths: Set[str],
+        identifier_to_file: Dict[str, str],
+        file_records: Dict[str, _FileWorkItem],
+        plan: MigrationPlan,
+        graph_targets_by_path: Optional[Dict[str, MigrationTarget]],
+    ) -> None:
+        for error in build_result.compiler_errors:
+            if error.file_path and error.file_path not in file_records:
+                added = self._ensure_work_item(
+                    error.file_path,
+                    file_records,
+                    target_file_paths,
+                    identifier_to_file,
+                    plan,
+                    graph_targets_by_path,
+                    is_test=False,
+                )
+                if added is not None:
+                    print(
+                        f" [DISCOVERED] {error.file_path} - added as repair target"
+                    )
 
-        try:
-            apply_patch(self.repo_path,patch)
-        except SecurityViolationError as exc:
-            record.errors_encountered=[f"Guardrail rejected path: {exc}"]
-            print(f" [PASS1 REJECTED] {target.file_path}: {exc}")
-            return record
+        for failure in build_result.failed_tests:
+            matched_path = None
+            for ident, fpath in identifier_to_file.items():
+                if ident == failure.test_class or ident.endswith(f".{failure.test_class}"):
+                    matched_path = fpath
+                    break
+            if matched_path and matched_path not in file_records:
+                added = self._ensure_work_item(
+                    matched_path,
+                    file_records,
+                    target_file_paths,
+                    identifier_to_file,
+                    plan,
+                    graph_targets_by_path,
+                    is_test=True,
+                )
+                if added is not None:
+                    print(
+                        f" [DISCOVERED] {matched_path} - added failing test as repair target"
+                    )
 
-        print(f" [TRANSFORMED] {target.file_path} ({commit_summary})")
-        return record
+    def _resolve_repair_rule(
+        self,
+        file_path: str,
+        record: _FileWorkItem,
+        source_code: str,
+        plan: MigrationPlan,
+        compiler_errors: List[CompilerError],
+        failed_tests: List[TestFailure],
+    ) -> str:
+        if (
+            record.applied_by == "openrewrite"
+            and (compiler_errors or failed_tests)
+        ):
+            if file_path.endswith(".java"):
+                cur_manifest = parse_manifest_cached(
+                    self.ast_parser,
+                    self.repo_path,
+                    file_path,
+                    self._manifest_cache,
+                )
+                cur_matched = (
+                    [
+                        r.id
+                        for r in SPRING_BOOT_3_RULES
+                        if r.predicate(cur_manifest)
+                    ]
+                    if cur_manifest is not None
+                    else []
+                )
+                if cur_matched:
+                    rule, _ = _migration_spec_for(
+                        file_path, cur_matched, plan, source_code
+                    )
+                    return rule
+                return GENERIC_SPRING_BOOT_3_RULE
+            rule, _ = _migration_spec_for(file_path, [], plan, source_code)
+            return rule
+        return record.migration_rule
 
-    """Pass 2 - Verification & Targeted Self-Repair (Docker sandbox):
-        Run the real build once. If it's green, commit everything and run
-        the post-execution integrity guardrails. If it's red, group the
-        diagnostics by which target file they belong to and send ONLY that
-        file's own errors back to the LLM for a scoped repair, then rebuild."""
     def _pass2_verify_and_repair(
-            self,
-            file_records:Dict[str,_FileWorkItem],
-            target_file_paths:Set[str],
-            identifier_to_file:Dict[str,str]
-    )->BuildResult:
-        build_result:Optional[BuildResult]=None
-        round_number=0
+        self,
+        file_records: Dict[str, _FileWorkItem],
+        target_file_paths: Set[str],
+        identifier_to_file: Dict[str, str],
+        plan: MigrationPlan,
+        pom_has_h2: bool = False,
+        modified_files: Optional[Set[str]] = None,
+        fqcn_to_file: Optional[Dict[str, str]] = None,
+        package_to_files: Optional[Dict[str, List[str]]] = None,
+        graph_targets_by_path: Optional[Dict[str, MigrationTarget]] = None,
+        planned_targets_by_path: Optional[Dict[str, MigrationTarget]] = None,
+        openrewrite_error: Optional[str] = None,
+    ) -> BuildResult:
+        build_result: Optional[BuildResult] = None
+        round_number = 0
+        repaired_test_files: Set[str] = set()
+        runtime_repaired_app_files: Set[str] = set()
+        active_maven_args: Optional[List[str]] = (
+            list(self.maven_args) if self.maven_args is not None else None
+        )
+        active_services: Optional[List[ServiceRequirement]] = None
+        tried_db_fallbacks: Set[str] = set()
 
         while True:
-            build_result=self._verify_in_sandbox()
+            build_result = self._verify_in_sandbox(active_maven_args, active_services)
 
             if not build_result.success:
                 print(build_result.raw_logs)
@@ -241,175 +642,648 @@ class MigrationOrchestrator:
                 print(f" [BUILD_GREEN] after {round_number} repair round(s)")
                 break
 
-            round_number+=1
-            if round_number>self.retry_budget:
-                print(f" [BUDGET SPENT] repair budget ({self.retry_budget} round(s) exhausted; build still red)")
+            failure_kind = classify_build_failure(
+                build_result.raw_logs,
+                build_result.compiler_errors,
+                build_result.failed_tests,
+                exit_code=build_result.exit_code,
+            )
+            if failure_kind == "environment":
+                if (
+                    "dynamic_services" not in tried_db_fallbacks
+                    and getattr(self.docker_runner, "dynamic_services", False)
+                ):
+                    inferred = detect_required_services(
+                        self.repo_path,
+                        raw_logs=build_result.raw_logs,
+                        maven_args=active_maven_args,
+                    )
+                    if inferred and active_services is None:
+                        tried_db_fallbacks.add("dynamic_services")
+                        active_services = inferred
+                        svc_list = ", ".join(f"{s.kind}:{s.port}" for s in inferred)
+                        print(
+                            f" [SANDBOX SERVICES] Log diagnostics indicate missing service(s) "
+                            f"({svc_list}); retrying with ephemeral sidecar containers..."
+                        )
+                        continue
+
+                if is_database_environment_failure(
+                    build_result.raw_logs, build_result.failed_tests
+                ):
+                    fallback = resolve_sandbox_db_fallback_args(
+                        repo_path=self.repo_path,
+                        pom_has_h2=pom_has_h2,
+                        initial_maven_args=self.maven_args,
+                        current_maven_args=active_maven_args,
+                        tried_fallbacks=tried_db_fallbacks,
+                    )
+                    if fallback is not None:
+                        key, reason, next_args = fallback
+                        tried_db_fallbacks.add(key)
+                        active_maven_args = next_args
+                        active_services = None
+                        print(
+                            f" [SANDBOX DB FALLBACK] {reason}; "
+                            "retrying verification without mutating repository config."
+                        )
+                        continue
+                env_reason = "; ".join(
+                    e.message for e in build_result.compiler_errors[:2] if e.message
+                )
+                suffix = f" ({env_reason})" if env_reason else ""
+                print(
+                    f" [ENV FAILURE] Build failed due to external/environment issue "
+                    f"(exit_code={build_result.exit_code}){suffix}; "
+                    "aborting repair loop without modifying code."
+                )
                 break
 
-            # ── Dynamic target discovery ──────────────────────────────────
-            # If errors come from files not yet in the target set, adopt them
-            # so the repair loop can fix them instead of being stuck.
-            for error in build_result.compiler_errors:
-                if error.file_path and error.file_path not in target_file_paths:
-                    new_file=self.repo_path/error.file_path
-                    if not new_file.is_file():
-                        continue
-                    target_file_paths.add(error.file_path)
-                    identifier_to_file[error.file_path]=error.file_path
-                    rule,summary=_migration_spec_for(error.file_path,[])
-                    new_target=MigrationTarget(
-                        identifier=error.file_path,
-                        file_path=error.file_path,
-                        package_name=None,
-                        migration_depth=0,
-                        in_degree=0,
-                        out_degree=0,
-                        is_leaf=True,
-                        is_test=False,
-                        has_javax=False,
-                        matched_rules=[]
-                    )
-                    file_records[error.file_path]=_FileWorkItem(
-                        target=new_target,
-                        migration_rule=rule,
-                        commit_summary=summary
-                    )
-                    print(f" [DISCOVERED] {error.file_path} — added as new migration target")
+            round_number += 1
+            if round_number > self.retry_budget:
+                print(
+                    f" [BUDGET SPENT] repair budget ({self.retry_budget} round(s) exhausted; build still red)"
+                )
+                break
 
-            grouped=_group_diagnostics_by_target(
-                build_result.compiler_errors,build_result.failed_tests,target_file_paths,identifier_to_file
+            self._discover_missing_targets(
+                build_result,
+                target_file_paths,
+                identifier_to_file,
+                file_records,
+                plan,
+                graph_targets_by_path,
             )
-            actionable={
-                file_path:diags for file_path,diags in grouped.items()
-                if file_path in file_records and not file_records[file_path].skipped
+
+            grouped = _group_diagnostics_by_target(
+                build_result.compiler_errors,
+                build_result.failed_tests,
+                target_file_paths,
+                identifier_to_file,
+            )
+            actionable = {
+                file_path: diags
+                for file_path, diags in grouped.items()
+                if file_path in file_records
+                and file_records[file_path].state not in (FileStatus.SKIPPED, FileStatus.REJECTED)
             }
+
+            # javac defaults to -Xmaxerrs 100, hiding downstream failing targets on large repos.
+            # When javac reaches its error cap, surface unattempted non-OpenRewrite planned targets
+            # from ingestion so Pass 2 can migrate them together instead of leaking across extra rounds.
+            javac_truncated = len(build_result.compiler_errors) >= 80 or (
+                "too many errors" in (build_result.raw_logs or "").lower()
+            )
+            if javac_truncated and planned_targets_by_path:
+                surfaced_count = 0
+                for fpath, pt in planned_targets_by_path.items():
+                    if fpath in actionable or fpath in file_records:
+                        continue
+                    added = self._ensure_work_item(
+                        fpath,
+                        file_records,
+                        target_file_paths,
+                        identifier_to_file,
+                        plan,
+                        graph_targets_by_path,
+                        is_test=pt.is_test,
+                    )
+                    if added is not None and added.state not in (
+                        FileStatus.SKIPPED,
+                        FileStatus.REJECTED,
+                    ):
+                        actionable[fpath] = ([], [])
+                        surfaced_count += 1
+                if surfaced_count:
+                    print(
+                        f" [DISCOVERED] surfaced {surfaced_count} unattempted planned target(s) "
+                        f"(javac reported {len(build_result.compiler_errors)} errors)"
+                    )
+
+            # If Pass 1 did not upgrade pom.xml (e.g. --no-openrewrite or maven_only failure)
+            # and sandbox build failed with unattributed build/POM diagnostics, repair pom.xml first.
+            if (
+                not actionable
+                and (not build_result.compiler_errors or all(e.file_path is None for e in build_result.compiler_errors))
+                and not build_result.failed_tests
+                and (self.repo_path / "pom.xml").is_file()
+            ):
+                pom_rec = self._ensure_work_item(
+                    "pom.xml",
+                    file_records,
+                    target_file_paths,
+                    identifier_to_file,
+                    plan,
+                    graph_targets_by_path,
+                    is_test=False,
+                )
+                if pom_rec is not None and pom_rec.state not in (FileStatus.SKIPPED, FileStatus.REJECTED):
+                    actionable = {"pom.xml": (list(build_result.compiler_errors), [])}
+
+            runtime_log_excerpt: Optional[str] = None
+            repair_context: Optional[str] = (
+                f"Pass 1 OpenRewrite reported: {openrewrite_error}"
+                if openrewrite_error
+                else None
+            )
+            is_runtime_pivot = False
+            if not build_result.compiler_errors and build_result.failed_tests:
+                only_test_targets = bool(actionable) and all(
+                    file_records[fp].target.is_test for fp in actionable
+                )
+                already_tried_test = bool(actionable) and all(
+                    fp in repaired_test_files for fp in actionable
+                )
+                if only_test_targets and (
+                    looks_like_app_runtime_failure(
+                        build_result.failed_tests, build_result.raw_logs
+                    )
+                    or already_tried_test
+                ):
+                    implicated_stems = extract_implicated_bean_stems(build_result.raw_logs)
+
+                    # Materialize unmigrated non-test planned targets and any implicated repo classes
+                    if planned_targets_by_path:
+                        for fpath, pt in planned_targets_by_path.items():
+                            if not pt.is_test and fpath not in file_records:
+                                self._ensure_work_item(
+                                    fpath,
+                                    file_records,
+                                    target_file_paths,
+                                    identifier_to_file,
+                                    plan,
+                                    graph_targets_by_path,
+                                    is_test=False,
+                                )
+
+                    for stem in implicated_stems:
+                        for fpath in set(identifier_to_file.values()):
+                            if (
+                                Path(fpath).stem.lower() == stem
+                                and fpath not in file_records
+                                and (self.repo_path / fpath).is_file()
+                                and "/src/test/" not in f"/{fpath}"
+                            ):
+                                self._ensure_work_item(
+                                    fpath,
+                                    file_records,
+                                    target_file_paths,
+                                    identifier_to_file,
+                                    plan,
+                                    graph_targets_by_path,
+                                    is_test=False,
+                                )
+
+                    app_candidates = sorted(
+                        (
+                            fp
+                            for fp, rec in file_records.items()
+                            if not rec.target.is_test
+                            and rec.state not in (FileStatus.SKIPPED, FileStatus.REJECTED)
+                            and fp not in runtime_repaired_app_files
+                        ),
+                        key=lambda fp: (
+                            0 if Path(fp).stem.lower() in implicated_stems else 1,
+                            0
+                            if any(
+                                r in file_records[fp].target.matched_rules
+                                for r in (
+                                    "security-configurer-adapter-removal",
+                                    "resource-migration",
+                                    "springfox-to-springdoc",
+                                    "hibernate-5-to-6",
+                                )
+                            )
+                            else 1,
+                            app_candidate_priority(fp, file_records[fp]),
+                        ),
+                    )
+                    prioritized_implicated = [
+                        fp for fp in app_candidates if Path(fp).stem.lower() in implicated_stems
+                    ]
+                    unmigrated_or_llm = [
+                        fp
+                        for fp in app_candidates
+                        if file_records[fp].applied_by in (None, "llm")
+                    ]
+                    high_risk_candidates = [
+                        fp
+                        for fp in app_candidates
+                        if any(
+                            r in file_records[fp].target.matched_rules
+                            for r in (
+                                "security-configurer-adapter-removal",
+                                "resource-migration",
+                                "springfox-to-springdoc",
+                                "hibernate-5-to-6",
+                            )
+                        )
+                    ]
+                    if prioritized_implicated:
+                        chosen = prioritized_implicated[:2]
+                    elif unmigrated_or_llm:
+                        chosen = unmigrated_or_llm[:2]
+                    elif high_risk_candidates:
+                        chosen = high_risk_candidates[:2]
+                    elif app_candidates:
+                        chosen = app_candidates[:1]
+                    else:
+                        chosen = []
+
+                    if chosen:
+                        is_runtime_pivot = True
+                        actionable = {
+                            fp: ([], list(build_result.failed_tests)) for fp in chosen
+                        }
+                        runtime_log_excerpt = extract_runtime_log_excerpt(
+                            build_result.raw_logs
+                        )
+                        repair_context = (
+                            "Integration/runtime test(s) or Spring ApplicationContext startup failed "
+                            "during verification. Do NOT expect the test assertions to change; "
+                            "inspect this application file for Spring Boot 3 / Spring Security 6 / "
+                            "bean wiring / Thymeleaf / configuration compatibility bugs causing the failures."
+                        )
+                    elif already_tried_test:
+                        actionable = {}
+
             if not actionable:
-                print(" [STUCK] build failed but no diagnostics could be attributed to a tracked target; stopping")
+                unattributed = "; ".join(
+                    e.message for e in build_result.compiler_errors[:3] if e.message
+                )
+                detail = f": {unattributed}" if unattributed else ""
+                print(
+                    f" [STUCK] build failed (exit_code={build_result.exit_code}) "
+                    f"with no further repairable targets{detail}; stopping"
+                )
                 break
 
             self._transition(WorkflowState.REPAIRING)
-            print(f" round {round_number}/{self.retry_budget}: repairing {len(actionable)} file(s) "
-                  f"->{', '.join(sorted(actionable))}")
+            ordered_actionable = sorted(
+                actionable.items(),
+                key=lambda kv: (
+                    file_records[kv[0]].target.migration_depth,
+                    -file_records[kv[0]].target.in_degree,
+                    kv[0],
+                ),
+            )
 
-            repaired_any=False
-            for file_path,(compiler_errors,failed_tests) in actionable.items():
-                record=file_records[file_path]
-                record.attempts+=1
+            if len(ordered_actionable) > 1 and fqcn_to_file:
+                actionable_paths = {fp for fp, _ in ordered_actionable}
+                ancestors_by_path: Dict[str, Set[str]] = {}
+                for fp, _ in ordered_actionable:
+                    if fp.endswith(".java"):
+                        ancs = expand_type_ancestors(
+                            [fp],
+                            self.repo_path,
+                            self.ast_parser,
+                            fqcn_to_file,
+                            self._manifest_cache,
+                            max_depth=4,
+                            include_seeds=False,
+                        )
+                        ancestors_by_path[fp] = set(ancs.keys()) & actionable_paths
 
-                record.errors_encountered=_diagnostics_summary(compiler_errors,failed_tests)
+                deferred_paths: Set[str] = set()
+                for fp, (c_errs, f_tests) in ordered_actionable:
+                    if not fp.endswith(".java") or not is_pure_cascading_override_failure(
+                        c_errs, f_tests
+                    ):
+                        continue
+                    if ancestors_by_path.get(fp):
+                        deferred_paths.add(fp)
+                if deferred_paths and len(deferred_paths) < len(ordered_actionable):
+                    ordered_actionable = [
+                        (fp, diags)
+                        for fp, diags in ordered_actionable
+                        if fp not in deferred_paths
+                    ]
+                    print(
+                        f" [DEFERRED] {len(deferred_paths)} subclass(es) with cascading override errors "
+                        "waiting on parent repair in this round"
+                    )
+                ordered_actionable = _order_actionable_ancestors_first(
+                    ordered_actionable, ancestors_by_path
+                )
+
+            print(
+                f" round {round_number}/{self.retry_budget}: resolving {len(ordered_actionable)} file(s) with AI "
+                f"-> {', '.join(fp for fp, _ in ordered_actionable)}"
+            )
+
+            repaired_any = False
+            for file_path, (compiler_errors, failed_tests) in ordered_actionable:
+                record = file_records[file_path]
+                record.attempts += 1
+                record.state = FileStatus.GENERATING
+                cur_compiler_sigs = {
+                    re.sub(r"\s+", " ", e.message.strip())
+                    for e in compiler_errors
+                    if e.message and e.message.strip()
+                }
+                is_repeat_compiler_failure = bool(
+                    record.prev_compiler_signatures & cur_compiler_sigs
+                )
+                record.prev_compiler_signatures = cur_compiler_sigs
+                record.errors_encountered = _diagnostics_summary(
+                    compiler_errors, failed_tests
+                )
+                if record.target.is_test:
+                    repaired_test_files.add(file_path)
+                elif is_runtime_pivot:
+                    runtime_repaired_app_files.add(file_path)
+
                 try:
-                    source_code=(self.repo_path/file_path).read_text(encoding="utf-8")
-                    patch=self.generate_patch(file_path,source_code,record.migration_rule,compiler_errors,failed_tests)
-                    apply_patch(self.repo_path,patch)
-                    repaired_any=True
+                    source_code = (self.repo_path / file_path).read_text(
+                        encoding="utf-8"
+                    )
+                    effective_excerpt = runtime_log_excerpt
+                    if not effective_excerpt and (
+                        Path(file_path).name == "pom.xml"
+                        or any(e.file_path is None for e in build_result.compiler_errors)
+                    ):
+                        effective_excerpt = extract_runtime_log_excerpt(
+                            build_result.raw_logs
+                        )
+                    effective_rule = self._resolve_repair_rule(
+                        file_path,
+                        record,
+                        source_code,
+                        plan,
+                        compiler_errors,
+                        failed_tests,
+                    )
+                    dep_context = collect_dependency_context(
+                        repo_path=self.repo_path,
+                        target_file_path=file_path,
+                        file_records=file_records,
+                        modified_files=modified_files or set(),
+                        fqcn_to_file=fqcn_to_file or {},
+                        package_to_files=package_to_files or {},
+                        is_repair=True,
+                        include_unmodified_locals=True,
+                        compiler_errors=compiler_errors,
+                        parser=self.ast_parser,
+                        manifest_cache=self._manifest_cache,
+                    )
+                    effective_repair_context = repair_context
+                    if is_repeat_compiler_failure:
+                        repeat_note = (
+                            "REPEAT REPAIR FAILURE: Your previous patch produced the EXACT same compiler error(s) again. "
+                            "Do NOT keep calling the failing method with incompatible argument types; rewrite the offending line(s) "
+                            "using a compatible method signature from 'Updated local project dependencies' or execute the query/logic "
+                            "directly via Session / CriteriaBuilder / EntityManager."
+                        )
+                        effective_repair_context = (
+                            f"{repair_context}\n\n{repeat_note}"
+                            if repair_context
+                            else repeat_note
+                        )
+                    patch = self.generate_patch(
+                        file_path,
+                        source_code,
+                        effective_rule,
+                        compiler_errors,
+                        failed_tests,
+                        runtime_log_excerpt=effective_excerpt,
+                        migration_context=effective_repair_context,
+                        dependency_context=dep_context,
+                    )
+                    _, diff = apply_patch_with_diff(
+                        self.repo_path, patch, expected_target_path=file_path
+                    )
+                    if diff and diff.strip():
+                        self._manifest_cache.pop(file_path, None)
+                        record.state = FileStatus.PATCH_APPLIED
+                        record.applied_by = "llm"
+                        record.diff = diff
+                        repaired_any = True
+                        if modified_files is not None:
+                            modified_files.add(file_path)
+                    elif record.applied_by is not None:
+                        record.state = FileStatus.PATCH_APPLIED
+                    else:
+                        record.state = FileStatus.PENDING
                 except LLMProviderError as exc:
+                    record.state = FileStatus.FAILED
                     record.errors_encountered.append(f"LLM generation failed: {exc}")
                 except SecurityViolationError as exc:
-                    record.errors_encountered.append(f"Guardrail rejected patch: {exc}")
+                    record.state = FileStatus.REJECTED
+                    record.errors_encountered.append(
+                        f"Guardrail rejected patch: {exc}"
+                    )
 
             if not repaired_any:
-                print(" [STUCK] every targeted file failed to produce a new patch; stopping")
+                print(
+                    " [STUCK] repair pass produced no effective code changes; stopping"
+                )
                 break
 
         return build_result
 
-    def _current_head_sha(self)->Optional[str]:
-        try:
-            from git import Repo
-            return Repo(self.repo_path).head.commit.hexsha
-        except Exception:
-            return None
+    def run(self, ingestion_report: ProjectIngestionReport) -> MigrationRunSummary:
+        start = time.monotonic()
+        plan = ingestion_report.migration_plan or build_migration_plan(
+            ingestion_report.pom
+        )
 
-    def run(self,ingestion_report:ProjectIngestionReport)->MigrationRunSummary:
-        start=time.monotonic()
-        self._transition(WorkflowState.INITIALIZING)
+        baseline_manifests = self.ast_parser.parse_repo()
+        self._manifest_cache = {m.file_path: m for m in baseline_manifests}
+        baseline_test_count = sum(m.test_count for m in baseline_manifests)
+        print(
+            f"[orchestrator] baseline: {len(baseline_manifests)} Java file(s), "
+            f"{baseline_test_count} @Test method(s), "
+            f"{len(ingestion_report.files_to_migrate)} migration target(s), "
+            f"target Boot={plan.target_spring_boot}"
+        )
 
-        baseline_manifests=JavaAstParser(str(self.repo_path)).parse_repo()
-        baseline_test_count=sum(m.test_count for m in baseline_manifests)
-        print(f"[orchestrator] baseline: {len(baseline_manifests)} Java file(s), "
-              f"{baseline_test_count} @Test method(s), "
-              f"{len(ingestion_report.files_to_migrate)} migration target(s)")
+        fqcn_to_file, package_to_files = build_local_dep_lookup(baseline_manifests)
+        graph_targets_by_path = {
+            t.file_path: t for t in ingestion_report.graph.migration_order
+        }
+        identifier_to_file = {
+            t.identifier: t.file_path for t in ingestion_report.graph.migration_order
+        }
+        planned_targets_by_path = {
+            t.file_path: t for t in ingestion_report.files_to_migrate
+        }
+        for t in ingestion_report.files_to_migrate:
+            identifier_to_file.setdefault(t.identifier, t.file_path)
+            graph_targets_by_path.setdefault(t.file_path, t)
 
-        identifier_to_file={t.identifier:t.file_path for t in ingestion_report.files_to_migrate}
-        target_file_paths={t.file_path for t in ingestion_report.files_to_migrate}
-        print("[orchestrator] Pass 1/2: batch-transforming every target file(no sandbox verification yet)")
-        
-        file_records:Dict[str,_FileWorkItem]={}
-        for target in ingestion_report.files_to_migrate:
-            file_records[target.file_path]=self._pass1_transform(target)
+        file_records: Dict[str, _FileWorkItem] = {}
+        modified_files: Set[str] = set()
 
-        print("[orchestrator] Pass 2/2: verifying the full build and repairing targeted failures")
+        print(
+            "[orchestrator] Pass 1/2: running OpenRewrite migration pass (OpenRewrite only)"
+        )
+        openrewrite_result = self._run_openrewrite_pass(
+            plan=plan,
+            graph_targets_by_path=graph_targets_by_path,
+            file_records=file_records,
+            modified_files=modified_files,
+        )
 
-        build_result=self._pass2_verify_and_repair(file_records,target_file_paths,identifier_to_file)
-        commit_sha:Optional[str]=None
-        if build_result.success:
-            self._transition(WorkflowState.COMMITING)
-            migrated_paths=[fp for fp,rec in file_records.items() if not rec.skipped]
-            commit_sha=commit_patch(
-                self.repo_path,
-                commit_message=f"Migrate {len(migrated_paths)} file(s): Spring Boot 2 -> 3, Java 17, javax -> jakarta",
-                file_path=None
-            )
-            print(f" [COMMIT] {commit_sha[:10]} ({len(migrated_paths)} file(s))")
-        else:
-            print(" [ROLLBACK] build never went green; reverting the entire workspace to baseline")
-            self._rollback_all()
+        pom_has_h2 = any(
+            dep.artifact_id == "h2" or dep.group_id == "com.h2database"
+            for dep in ingestion_report.pom.dependencies
+        )
 
-        file_statuses:List[FileMigrationStatus]=[]
-        for file_path,record in file_records.items():
-            if record.skipped:
-                status=FileStatus.SKIPPED
-            elif build_result.success:
-                status=FileStatus.SUCCESS
-            else:
-                status=FileStatus.FAILED
-                if not record.errors_encountered:
-                    record.errors_encountered=[
-                        "Build never went green because of sibling file's unresolved errors; "
-                        "this file's own patch was never implicated"
-                    ]
+        target_file_paths = {t.file_path for t in ingestion_report.files_to_migrate} | set(
+            file_records.keys()
+        )
 
-            file_statuses.append(
-                FileMigrationStatus(
-                    file_path=file_path,
-                    attempts=record.attempts,
-                    status=status,
-                    commit_sha=commit_sha if status==FileStatus.SUCCESS else None,
-                    errors_encountered=record.errors_encountered
-                )
-            )
+        print(
+            "[orchestrator] Pass 2/2: verifying code in sandbox and resolving any errors with AI"
+        )
+        build_result = self._pass2_verify_and_repair(
+            file_records=file_records,
+            target_file_paths=target_file_paths,
+            identifier_to_file=identifier_to_file,
+            plan=plan,
+            pom_has_h2=pom_has_h2,
+            modified_files=modified_files,
+            fqcn_to_file=fqcn_to_file,
+            package_to_files=package_to_files,
+            graph_targets_by_path=graph_targets_by_path,
+            planned_targets_by_path=planned_targets_by_path,
+            openrewrite_error=(
+                openrewrite_result.error if openrewrite_result else None
+            ),
+        )
 
-        total_retries=sum(max(r.attempts-1,0) for r in file_records.values())
-
+        # Post-execution integrity checks MUST run BEFORE committing!
         if build_result.success:
             self._transition(WorkflowState.POST_INTEGRITY_CHECK)
-            integrity=run_post_execution_integrity(self.repo_path,baseline_manifests,baseline_test_count)
+            integrity = run_post_execution_integrity(
+                self.repo_path, baseline_manifests, baseline_test_count
+            )
             for violation in integrity.violations:
                 print(f" [INTEGRITY VIOLATION] {violation}")
         else:
-            integrity=PostExecutionIntegrityResult(
+            integrity = PostExecutionIntegrityResult(
                 baseline_test_count=baseline_test_count,
                 final_test_count=baseline_test_count,
                 test_count_passed=True,
                 missing_public_methods=[],
                 method_signatures_passed=True,
                 passed=False,
-                violations=["Migration aborted before a passing build was reached; "
-                            "no commit was made and the workspace was reverted to baseline."]
+                violations=[
+                    "Migration aborted before a passing build was reached; "
+                    "no commit was made and the workspace was reverted to baseline."
+                ],
             )
 
-        final_state=WorkflowState.COMPLETED if (build_result.success and integrity.passed) else WorkflowState.FAILED
+        has_unrepaired_failures = any(
+            rec.state in (FileStatus.FAILED, FileStatus.REJECTED)
+            for rec in file_records.values()
+        )
+        if has_unrepaired_failures and integrity.passed:
+            integrity.passed = False
+            integrity.violations.append(
+                "One or more target files failed transformation or were rejected by guardrails; "
+                "aborting commit to prevent false-success migration."
+            )
+
+        commit_sha: Optional[str] = None
+        can_commit = build_result.success and integrity.passed and not has_unrepaired_failures
+
+        if can_commit:
+            for rec in file_records.values():
+                if rec.state == FileStatus.PATCH_APPLIED:
+                    rec.state = FileStatus.VALIDATED
+
+            self._transition(WorkflowState.COMMITING)
+            migrated_paths = [
+                fp
+                for fp, rec in file_records.items()
+                if rec.state == FileStatus.VALIDATED
+            ]
+            commit_sha = commit_patch(
+                self.repo_path,
+                commit_message=(
+                    f"Migrate {len(migrated_paths)} file(s): "
+                    f"Spring Boot {plan.source_spring_boot or '2.x'} -> {plan.target_spring_boot}, "
+                    f"Java {plan.target_java}"
+                ),
+                file_path=None,
+            )
+            print(f" [COMMIT] {commit_sha[:10]} ({len(migrated_paths)} file(s))")
+        else:
+            print(
+                " [ROLLBACK] build or integrity checks failed; reverting workspace to baseline without committing"
+            )
+            self._rollback_all()
+
+        file_statuses: List[FileMigrationStatus] = []
+        for file_path, record in file_records.items():
+            if record.state == FileStatus.SKIPPED:
+                final_file_status = FileStatus.SKIPPED
+            elif record.state == FileStatus.REJECTED:
+                final_file_status = FileStatus.REJECTED
+            elif can_commit and record.state == FileStatus.VALIDATED:
+                final_file_status = FileStatus.SUCCESS
+            elif can_commit and record.state == FileStatus.PENDING:
+                final_file_status = FileStatus.SKIPPED
+            else:
+                final_file_status = FileStatus.FAILED
+                if not record.errors_encountered:
+                    record.errors_encountered = [
+                        "Migration rolled back because build or post-execution integrity checks failed."
+                    ]
+
+            file_statuses.append(
+                FileMigrationStatus(
+                    file_path=file_path,
+                    attempts=record.attempts,
+                    status=final_file_status,
+                    applied_by=record.applied_by,
+                    commit_sha=commit_sha
+                    if final_file_status == FileStatus.SUCCESS
+                    else None,
+                    diff=record.diff,
+                    errors_encountered=record.errors_encountered,
+                )
+            )
+
+        total_retries = sum(max(r.attempts - 1, 0) for r in file_records.values())
+        final_state = (
+            WorkflowState.COMPLETED if can_commit else WorkflowState.FAILED
+        )
         self._transition(final_state)
+
+        last_build_errors = (
+            _diagnostics_summary(
+                build_result.compiler_errors, build_result.failed_tests
+            )
+            if not build_result.success
+            else []
+        )
+        if not build_result.success and not last_build_errors:
+            last_build_errors = [
+                f"Maven sandbox exited with code {build_result.exit_code} after {build_result.duration_seconds}s without structured compiler/test diagnostics."
+            ]
 
         return MigrationRunSummary(
             repo_url=ingestion_report.repo_info.repo_url,
             baseline_commit=ingestion_report.repo_info.baseline_sha,
             final_commit=self._current_head_sha(),
-            total_files_migrated=sum(1 for s in file_statuses if s.status==FileStatus.SUCCESS),
+            target_spring_boot_version=plan.target_spring_boot,
+            openrewrite_used=bool(openrewrite_result and openrewrite_result.executed),
+            openrewrite_files_modified=len(openrewrite_result.modified_files)
+            if openrewrite_result
+            else 0,
+            total_files_migrated=sum(
+                1 for s in file_statuses if s.status == FileStatus.SUCCESS
+            ),
             total_retries=total_retries,
             file_statuses=file_statuses,
             integrity_passed=integrity.passed,
-            total_duration_seconds=round(time.monotonic()-start,2),
+            total_duration_seconds=round(time.monotonic() - start, 2),
             final_state=final_state,
-            integrity_violations=integrity.violations
+            integrity_violations=integrity.violations,
+            last_build_errors=last_build_errors,
+            last_build_logs_tail=(
+                build_result.raw_logs[-2000:] if not build_result.success else None
+            ),
         )

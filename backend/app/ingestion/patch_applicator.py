@@ -1,40 +1,49 @@
+import difflib
 from pathlib import Path
-import sys
-from typing import Optional
+from typing import Optional, Tuple
 
-from git import GitCommandError, Repo
-
-backend_root=Path(__file__).resolve().parents[2]
-if str(backend_root) not in sys.path:
-    sys.path.insert(0,str(backend_root))
+from git import Repo
 
 from app.guardrails.pre_execution import validate_patch_safety
 from app.models.agent import FilePatchResult
 
-def apply_patch(repo_path:Path,patch:FilePatchResult)->Path:
-    repo_path=Path(repo_path)
-    validate_patch_safety(repo_path,patch)
 
-    target_file=(repo_path.resolve()/patch.file_path).resolve()
-    target_file.parent.mkdir(parents=True,exist_ok=True)
-    target_file.write_text(patch.new_content,encoding="utf-8")
+def apply_patch_with_diff(
+    repo_path: Path,
+    patch: FilePatchResult,
+    expected_target_path: Optional[str] = None,
+) -> Tuple[Path, str]:
+    repo_path = Path(repo_path)
+    validate_patch_safety(repo_path, patch, expected_target_path=expected_target_path)
 
-    return target_file
+    target_file = (repo_path.resolve() / patch.file_path).resolve()
+    original_content = (
+        target_file.read_text(encoding="utf-8") if target_file.is_file() else ""
+    )
 
-def commit_patch(repo_path:Path,commit_message:str,file_path:Optional[str]=None)->str:
-    repo=Repo(repo_path)
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text(patch.new_content, encoding="utf-8")
+
+    diff = "".join(
+        difflib.unified_diff(
+            original_content.splitlines(keepends=True),
+            patch.new_content.splitlines(keepends=True),
+            fromfile=f"a/{patch.file_path}",
+            tofile=f"b/{patch.file_path}",
+        )
+    )
+    return target_file, diff
+
+
+def commit_patch(
+    repo_path: Path, commit_message: str, file_path: Optional[str] = None
+) -> str:
+    repo = Repo(repo_path)
 
     if file_path is not None:
         repo.index.add([file_path])
     else:
         repo.git.add(A=True)
 
-    commit=repo.index.commit(commit_message)
+    commit = repo.index.commit(commit_message)
     return commit.hexsha
-
-def rollback_patch(repo_path:Path,file_path:str)->None:
-    repo=Repo(repo_path)
-    try:
-        repo.git.checkout("--",file_path)
-    except GitCommandError as exc:
-        raise RuntimeError(f"Could not roll back {file_path}: {exc}") from exc
