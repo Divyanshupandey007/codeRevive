@@ -1,8 +1,8 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import Annotated, Any, List, Optional
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Anchor .env to the backend directory so keys load no matter which
 # directory the app/tests are launched from. config.py lives at
@@ -88,6 +88,63 @@ class Settings(BaseSettings):
             "System.exit",
         ]
     )
+
+    # HTTP API / Routing / Angular CORS & SPA settings
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+    api_prefix: str = "/api"
+    cors_allowed_origins: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "http://localhost:4200",
+            "http://127.0.0.1:4200",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
+    )
+    cors_allow_credentials: bool = True
+    cors_allowed_methods: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS",
+            "HEAD",
+        ]
+    )
+    cors_allowed_headers: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "Content-Type",
+            "Authorization",
+            "Accept",
+            "Origin",
+            "X-Requested-With",
+            "X-Request-ID",
+            "Prefer",
+        ]
+    )
+    cors_max_age_seconds: int = 600
+    max_request_body_bytes: int = 1_048_576
+    frontend_dist_dir: Optional[Path] = None
+
+    @field_validator(
+        "cors_allowed_origins",
+        "cors_allowed_methods",
+        "cors_allowed_headers",
+        mode="before",
+    )
+    @classmethod
+    def _parse_comma_separated_list(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                import json
+                return json.loads(stripped)
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+        return value
 
     @property
     def resolved_workspace_root(self) -> Path:
