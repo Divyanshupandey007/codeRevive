@@ -1,0 +1,6 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body th:with="isError=${#request.getAttribute('javax.servlet.error.status_code') ge 400}">
+  <h1 th:text="${title}">Home</h1>
+</body>
+</html>
