@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -68,6 +69,17 @@ from app.sandbox.diagnostics_parser import (
 )
 from app.sandbox.docker_runner import DockerRunner
 from app.sandbox.service_detector import ServiceRequirement, detect_required_services
+
+# Build result reported when a migration is cancelled mid-run: red, no diagnostics,
+# so the orchestrator rolls the workspace back to baseline without committing.
+_CANCELLED_BUILD_RESULT = BuildResult(
+    success=False,
+    exit_code=-1,
+    duration_seconds=0.0,
+    compiler_errors=[],
+    failed_tests=[],
+    raw_logs="Migration cancelled by user.",
+)
 
 GENERIC_SPRING_BOOT_3_RULE = (
     "This file needs to be updated for Spring Boot 3 compatibility. "
@@ -229,6 +241,7 @@ class MigrationOrchestrator:
         use_openrewrite: Optional[bool] = None,
         openrewrite_mode: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ):
         self.repo_path = Path(repo_path)
         self._llm_provider = llm_provider
@@ -246,6 +259,7 @@ class MigrationOrchestrator:
         )
         self.maven_args = maven_args
         self.progress_callback = progress_callback
+        self._cancel_event = cancel_event
         self.state = WorkflowState.INITIALIZING
         self._ast_parser: Optional[JavaAstParser] = None
         self._manifest_cache: Dict[str, Optional[JavaFileManifest]] = {}
@@ -650,6 +664,9 @@ class MigrationOrchestrator:
         tried_db_fallbacks: Set[str] = set()
 
         while True:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                build_result = _CANCELLED_BUILD_RESULT
+                break
             build_result = self._verify_in_sandbox(active_maven_args, active_services)
 
             if not build_result.success:
@@ -1084,16 +1101,24 @@ class MigrationOrchestrator:
                 except LLMProviderError as exc:
                     record.state = FileStatus.FAILED
                     record.errors_encountered.append(f"LLM generation failed: {exc}")
+                    if self.progress_callback:
+                        self.progress_callback(
+                            f"REPAIRING:LLM generation failed for {file_path}: {exc}"
+                        )
                 except SecurityViolationError as exc:
                     record.state = FileStatus.REJECTED
-                    record.errors_encountered.append(
-                        f"Guardrail rejected patch: {exc}"
-                    )
+                    record.errors_encountered.append(f"Guardrail rejected patch: {exc}")
+                    if self.progress_callback:
+                        self.progress_callback(
+                            f"REPAIRING:Guardrail rejected patch for {file_path}: {exc}"
+                        )
 
             if not repaired_any:
-                print(
-                    " [STUCK] repair pass produced no effective code changes; stopping"
-                )
+                if self.progress_callback:
+                    self.progress_callback(
+                        "REPAIRING:Repair pass produced no effective code changes; stopping"
+                    )
+                print(" [STUCK] repair pass produced no effective code changes; stopping")
                 break
 
         return build_result
@@ -1191,6 +1216,7 @@ class MigrationOrchestrator:
                 ],
             )
 
+        cancelled = self._cancel_event is not None and self._cancel_event.is_set()
         has_unrepaired_failures = any(
             rec.state in (FileStatus.FAILED, FileStatus.REJECTED)
             for rec in file_records.values()
@@ -1203,7 +1229,12 @@ class MigrationOrchestrator:
             )
 
         commit_sha: Optional[str] = None
-        can_commit = build_result.success and integrity.passed and not has_unrepaired_failures
+        can_commit = (
+            build_result.success
+            and integrity.passed
+            and not has_unrepaired_failures
+            and not cancelled
+        )
 
         if can_commit:
             for rec in file_records.values():
@@ -1227,9 +1258,8 @@ class MigrationOrchestrator:
             )
             print(f" [COMMIT] {commit_sha[:10]} ({len(migrated_paths)} file(s))")
         else:
-            print(
-                " [ROLLBACK] build or integrity checks failed; reverting workspace to baseline without committing"
-            )
+            reason = "Migration cancelled by user." if cancelled else "build or integrity checks failed"
+            print(f" [ROLLBACK] {reason}; reverting workspace to baseline without committing")
             self._rollback_all()
 
         file_statuses: List[FileMigrationStatus] = []

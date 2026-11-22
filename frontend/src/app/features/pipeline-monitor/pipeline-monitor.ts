@@ -28,12 +28,23 @@ export class PipelineMonitor {
 
   readonly job = signal<MigrationJobRecord | null>(null);
   readonly events = signal<MigrationJobEvent[]>([]);
+<<<<<<< HEAD
   readonly paused = signal(false);
   readonly now = signal(Date.now());
   readonly loadError = signal<string | null>(null);
 
   private readonly consoleRef = viewChild<ElementRef<HTMLDivElement>>('console');
 
+=======
+  readonly now = signal(Date.now());
+  readonly loadError = signal<string | null>(null);
+  readonly cancelling = signal(false);
+
+  private readonly consoleRef = viewChild<ElementRef<HTMLDivElement>>('console');
+
+  private readonly pollIntervalMs = 3_000; // was 1_000: two endpoints per tick, so this cuts polling traffic ~3x
+
+>>>>>>> 4bca8ea (feat: add job cancellation, fix stale audit report, harden workspace cleanup)
   readonly logLines = computed(() => this.events().map(eventToLogLine));
 
   /** Console lines annotated with whether a minimal loader should follow them.
@@ -116,25 +127,32 @@ export class PipelineMonitor {
   constructor() {
     if (this.jobId) {
       this.poll();
-      const timer = setInterval(() => {
-        this.now.set(Date.now());
+      // Keeps the "Working…" loader animation smooth between API polls.
+      const nowTimer = setInterval(() => this.now.set(Date.now()), 1_000);
+      const pollTimer = setInterval(() => {
         const status = this.job()?.status;
-        if (this.loadError() || status === 'COMPLETED' || status === 'FAILED') {
+        if (this.loadError() || status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') {
           return;
         }
         this.poll();
-      }, 1_000);
-      this.destroyRef.onDestroy(() => clearInterval(timer));
+      }, this.pollIntervalMs);
+      this.destroyRef.onDestroy(() => {
+        clearInterval(nowTimer);
+        clearInterval(pollTimer);
+      });
     }
 
-    // Auto-scroll the console unless paused.
+    // Auto-scroll the console when already near the bottom.
     effect(() => {
       const lines = this.logLines();
-      const paused = this.paused();
-      if (!paused && lines.length > 0) {
+      if (lines.length > 0) {
         queueMicrotask(() => {
           const el = this.consoleRef()?.nativeElement;
-          if (el) {
+          if (!el) {
+            return;
+          }
+          const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+          if (nearBottom) {
             el.scrollTop = el.scrollHeight;
           }
         });
@@ -177,8 +195,25 @@ export class PipelineMonitor {
     this.poll();
   }
 
+<<<<<<< HEAD
   togglePause(): void {
     this.paused.update((p) => !p);
+=======
+  cancel(): void {
+    if (!this.jobId || this.cancelling()) {
+      return;
+    }
+    this.cancelling.set(true);
+    this.api.cancelJob(this.jobId).subscribe({
+      next: () => {
+        this.cancelling.set(false);
+        this.poll();
+      },
+      error: () => {
+        this.cancelling.set(false);
+      },
+    });
+>>>>>>> 4bca8ea (feat: add job cancellation, fix stale audit report, harden workspace cleanup)
   }
 
   formatDuration(seconds: number): string {

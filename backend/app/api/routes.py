@@ -140,6 +140,11 @@ def delete_migration_job_endpoint(job_id: str) -> bool:
     return job_manager.delete(job_id)
 
 
+def cancel_migration_job_endpoint(job_id: str) -> bool:
+    """Best-effort cancellation of a queued or running migration job."""
+    return job_manager.cancel(job_id)
+
+
 def _describe_router_routes(router: APIRouter) -> List[Dict[str, Any]]:
     descriptors: List[Dict[str, Any]] = []
     for route in router.routes:
@@ -267,7 +272,9 @@ def build_api_router() -> APIRouter:
             status=job_status, limit=limit, offset=offset
         )
         try:
-            data["latest_available"] = get_latest_report_endpoint() is not None
+            data["latest_available"] = (
+                data.get("total", 0) > 0 and get_latest_report_endpoint() is not None
+            )
         except (ValueError, OSError):
             data["latest_available"] = False
         return data
@@ -295,9 +302,18 @@ def build_api_router() -> APIRouter:
     @router.get(
         "/api/migrations/latest",
         tags=["Migrations"],
-        summary="Get latest completed migration summary",
+        summary="Get latest completed migration summary (404 if no migration ran in this backend session)",
     )
     def latest_migration_route() -> Dict[str, Any]:
+        # The summary file survives backend restarts, but it must only be served
+        # when it is backed by an actual job run in this session — otherwise a
+        # stale report from before the restart would leak through.
+        _, total = job_manager.list_jobs(limit=1, offset=0)
+        if total == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No migration report found yet.",
+            )
         report = get_latest_report_endpoint()
         if report is None:
             raise HTTPException(
@@ -387,6 +403,21 @@ def build_api_router() -> APIRouter:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Migration job '{job_id}' not found.",
+            )
+        return {"deleted": True, "job_id": job_id}
+
+    @router.post(
+        "/api/migrations/jobs/{job_id}/cancel",
+        response_model=DeleteJobResponse,
+        tags=["Migration Jobs"],
+        summary="Request cancellation of a queued or running migration job",
+    )
+    def cancel_job_route(job_id: str) -> Dict[str, Any]:
+        cancelled = cancel_migration_job_endpoint(job_id)
+        if not cancelled:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Migration job '{job_id}' not found or cannot be cancelled.",
             )
         return {"deleted": True, "job_id": job_id}
 

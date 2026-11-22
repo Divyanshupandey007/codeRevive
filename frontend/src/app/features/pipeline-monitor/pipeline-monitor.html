@@ -9,7 +9,6 @@
   } @else if (job(); as j) {
     <header class="panel monitor-header">
       <div class="head-left">
-        <span class="mono job-id">{{ j.job_id }}</span>
         <span class="dim">{{ repoShort() }} · stage <span class="mono">{{ j.stage }}</span></span>
         @if (stageHint(); as hint) {
           <span class="stage-hint">{{ hint }}</span>
@@ -19,12 +18,17 @@
         <span
           class="badge"
           [class.badge-green]="j.status === 'COMPLETED'"
-          [class.badge-red]="j.status === 'FAILED'"
+          [class.badge-red]="j.status === 'FAILED' || j.status === 'CANCELLED'"
           [class.badge-amber]="j.status === 'RUNNING'"
           [class.badge-blue]="j.status === 'QUEUED'"
           >{{ j.status }}</span
         >
         <button class="btn btn-ghost btn-sm" (click)="refresh()">Refresh</button>
+        @if (j.status === 'QUEUED' || j.status === 'RUNNING') {
+          <button class="btn btn-danger btn-sm" (click)="cancel()" [disabled]="cancelling()">
+            {{ cancelling() ? 'Cancelling…' : 'Cancel migration' }}
+          </button>
+        }
         @if (j.status === 'COMPLETED') {
           <a class="btn btn-primary" [routerLink]="['/reports', j.job_id]">View Audit Report</a>
         } @else {
@@ -64,7 +68,7 @@
         <span class="metric-value mono">{{ formatDuration(elapsedSeconds()) }}</span>
       </div>
       <div class="metric">
-        <span class="metric-label">Active round</span>
+        <span class="metric-label" title="AI repair rounds beyond the first attempt (total_retries across all files)">Repair rounds</span>
         <span class="metric-value mono">{{ activeRound() }}</span>
       </div>
       <div class="metric">
@@ -92,10 +96,6 @@
       <div class="console-head">
         <span class="mono console-title">LIVE CONSOLE</span>
         <span class="dim">{{ logLines().length }} events</span>
-        <span class="spacer"></span>
-        <button class="btn btn-ghost btn-sm" (click)="togglePause()">
-          {{ paused() ? '▶ Resume' : '⏸ Pause' }}
-        </button>
       </div>
       <div class="console-body mono" #console>
         @for (entry of consoleLines(); track $index) {

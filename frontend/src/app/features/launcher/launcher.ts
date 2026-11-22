@@ -156,7 +156,8 @@ export class Launcher {
       branch_name: this.branchName().trim() || 'migration/spring-boot-3',
       use_openrewrite: this.profile.useOpenrewrite,
       openrewrite_mode: this.profile.strategy,
-      retry_budget: Math.max(0, Math.floor(this.retryBudget() || 0))
+      retry_budget: Math.max(0, Math.floor(this.retryBudget() || 0)),
+      clean: true
     };
     this.submitting.set(true);
     this.error.set(null);

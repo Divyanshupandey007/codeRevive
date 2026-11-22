@@ -4,7 +4,7 @@
  *   backend/app/orchestrator/service.py, backend/app/models/orchestrator.py
  */
 
-export type JobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+export type JobStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
 export type WorkflowState =
   | 'INITIALIZING'

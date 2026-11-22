@@ -1,6 +1,10 @@
 from pathlib import Path
+import os
 import re
 import shutil
+import stat
+import time
+import uuid
 from git import InvalidGitRepositoryError, Repo
 
 from app.config import settings
@@ -14,6 +18,33 @@ def _safe_repo_name(repo_url: str) -> str:
     if not cleaned or cleaned in (".", ".."):
         raise ValueError(f"Invalid repository URL or name: {repo_url!r}")
     return cleaned
+
+
+def _rmtree_force(path: Path, retries: int = 3, delay: float = 0.4) -> bool:
+    """Best-effort directory removal that tolerates Windows file locks.
+
+    Git pack files (`.git/objects/pack/*.idx`) and other files left behind by a
+    cancelled run are often read-only or briefly locked on Windows, which makes
+    a plain ``shutil.rmtree`` raise ``PermissionError`` ([WinError 5]).
+    This retries after making files writable and returns whether the dir is gone.
+    """
+    def _on_error(func, p, _exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        try:
+            func(p)
+        except OSError:
+            pass
+
+    for _ in range(retries):
+        try:
+            shutil.rmtree(path, onerror=_on_error)
+            return not path.exists()
+        except OSError:
+            time.sleep(delay)
+    return not path.exists()
 
 
 class GitWorkspaceManager:
@@ -44,14 +75,45 @@ class GitWorkspaceManager:
                 cfg.set_value("user", "email", "coderevive@local")
 
     @staticmethod
-    def _checkout_migration_branch(repo: Repo, branch_name: str) -> tuple[str, str]:
-        baseline_sha = repo.head.commit.hexsha
+    def _resolve_base_ref(repo: Repo) -> str:
+        """Resolve the upstream default branch commit rather than a prior migration commit.
+
+        Production migrations must always start from origin/HEAD (e.g. 20d013a), never
+        from a previously migrated migration/spring-boot-3 commit sitting in the local
+        workspace. Re-running against an already-migrated workspace would otherwise apply
+        OpenRewrite a second time and break idempotent transforms such as Pbkdf2 encoder
+        normalization.
+        """
+        try:
+            origin = repo.remotes.origin
+            for ref in origin.refs:
+                if ref.name == "origin/HEAD":
+                    return ref.commit.hexsha
+            ref_names = {ref.name for ref in origin.refs}
+            for candidate in ("origin/main", "origin/master"):
+                if candidate in ref_names:
+                    return repo.commit(candidate).hexsha
+        except Exception:
+            pass
+        return repo.head.commit.hexsha
+
+    @staticmethod
+    def _checkout_migration_branch(
+        repo: Repo, branch_name: str, reset_to_base: bool = False
+    ) -> tuple[str, str]:
+        base_sha = (
+            GitWorkspaceManager._resolve_base_ref(repo)
+            if reset_to_base
+            else repo.head.commit.hexsha
+        )
         if branch_name not in repo.heads:
-            migration_branch = repo.create_head(branch_name)
+            migration_branch = repo.create_head(branch_name, commit=base_sha)
         else:
             migration_branch = repo.heads[branch_name]
-        migration_branch.checkout()
-        return baseline_sha, repo.active_branch.name
+            if reset_to_base:
+                migration_branch.set_commit(base_sha)
+        migration_branch.checkout(force=reset_to_base)
+        return base_sha, repo.active_branch.name
 
     def prepare_workspace(
         self,
@@ -63,7 +125,12 @@ class GitWorkspaceManager:
         target_path = self.workspace_root / repo_name
 
         if target_path.exists() and clean:
-            shutil.rmtree(target_path)
+            if not _rmtree_force(target_path):
+                # A file in the workspace is locked (common on Windows after a
+                # cancelled run leaves git pack files open). Fall back to a fresh,
+                # uniquely-named workspace so the new migration can still run.
+                target_path = self.workspace_root / f"{repo_name}-{uuid.uuid4().hex[:8]}"
+                target_path.mkdir(parents=True, exist_ok=True)
 
         if not target_path.exists():
             cloned_repo = Repo.clone_from(repo_url, target_path)
@@ -77,7 +144,7 @@ class GitWorkspaceManager:
 
         self._ensure_git_identity(cloned_repo)
         baseline_sha, active_branch = self._checkout_migration_branch(
-            cloned_repo, branch_name
+            cloned_repo, branch_name, reset_to_base=True
         )
 
         return {
@@ -100,7 +167,9 @@ class GitWorkspaceManager:
 
         target_path = self.workspace_root / source_path.name
         if target_path.exists() and clean:
-            shutil.rmtree(target_path)
+            if not _rmtree_force(target_path):
+                target_path = self.workspace_root / f"{source_path.name}-{uuid.uuid4().hex[:8]}"
+                target_path.mkdir(parents=True, exist_ok=True)
 
         if not target_path.exists():
             shutil.copytree(

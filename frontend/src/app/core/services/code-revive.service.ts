@@ -98,6 +98,11 @@ export class CodeReviveService {
     return this.http.delete<DeleteJobResponse>(`${this.api}/migrations/jobs/${jobId}`);
   }
 
+  /** POST /api/migrations/jobs/{id}/cancel — request cancellation of a queued or running job. */
+  cancelJob(jobId: string): Observable<DeleteJobResponse> {
+    return this.http.post<DeleteJobResponse>(`${this.api}/migrations/jobs/${jobId}/cancel`, null);
+  }
+
   /** GET /api/migrations/latest — latest completed migration summary (404 if none). */
   getLatestReport(): Observable<MigrationRunSummary> {
     return this.http.get<MigrationRunSummary>(`${this.api}/migrations/latest`);
