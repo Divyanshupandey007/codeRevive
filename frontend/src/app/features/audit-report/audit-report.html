@@ -1,0 +1,146 @@
+<section class="report">
+  @if (loading()) {
+    <div class="panel loading dim">Loading audit report…</div>
+  } @else if (error()) {
+    <div class="panel error-banner">
+      <span class="badge badge-red">ERROR</span>
+      <span class="mono">{{ error() }}</span>
+      <span class="spacer"></span>
+      <a class="btn btn-ghost btn-sm" routerLink="/launcher">← New Migration</a>
+    </div>
+  } @else if (displaySummary(); as s) {
+    <header class="panel report-header">
+      <div class="head-left">
+        <h1>Audit Report</h1>
+        <span class="dim mono">
+          {{ reportId }} · {{ repoShort() }} · generated {{ s.generated_at | date: 'MMM d, y, HH:mm:ss' }}
+        </span>
+      </div>
+      <div class="head-actions">
+        @if (isRemoteRepo()) {
+          <a class="dim repo-link mono" [href]="githubRepoUrl()" target="_blank" rel="noopener noreferrer" title="Open repository on GitHub">↗ {{ repoShort() }}</a>
+        } @else {
+          <span class="dim repo-link mono" [title]="s.repo_url">{{ repoShort() }}</span>
+        }
+        <button type="button" class="btn" (click)="downloadPatch()">Download .patch</button>
+        <button type="button" class="btn" (click)="exportJson()">Export JSON</button>
+        <a class="btn btn-primary" routerLink="/launcher">← New Migration</a>
+      </div>
+    </header>
+
+    <div class="kpis">
+      <div class="panel kpi">
+        <span class="kpi-label">Final Status</span>
+        <span
+          class="badge"
+          [class.badge-green]="s.final_state === 'COMPLETED'"
+          [class.badge-red]="s.final_state === 'FAILED'"
+          [class.badge-amber]="s.final_state !== 'COMPLETED' && s.final_state !== 'FAILED'"
+          >{{ s.final_state }}</span
+        >
+      </div>
+      <div class="panel kpi">
+        <span class="kpi-label">Files Modernized</span>
+        <span class="kpi-value mono">{{ s.total_files_migrated }}</span>
+        <span class="kpi-sub dim">{{ s.openrewrite_files_modified }} via OpenRewrite</span>
+      </div>
+      <div class="panel kpi">
+        <span class="kpi-label">Repair</span>
+        <span class="kpi-value mono">{{ s.total_retries }} retries</span>
+        <span class="kpi-sub dim">{{ formatDuration(s.total_duration_seconds) }} total</span>
+      </div>
+      <div class="panel kpi">
+        <span class="kpi-label">Integrity Guardrail</span>
+        @if (s.integrity_passed) {
+          <span class="badge badge-green">✓ Baseline Tests Verified</span>
+        } @else {
+          <span class="badge badge-red">Violations Detected</span>
+        }
+        @if (s.integrity_violations.length > 0) {
+          <span class="kpi-sub dim mono">{{ s.integrity_violations.length }} violation(s)</span>
+        }
+      </div>
+      <div class="panel kpi">
+        <span class="kpi-label">Branch & Commit</span>
+        <span class="kpi-value mono kpi-branch">{{ branchName() }}</span>
+        @if (isRemoteRepo()) {
+          <a class="kpi-sub mono commit-link" [href]="commitUrl()" target="_blank" rel="noopener noreferrer">
+            {{ shortSha(s.final_commit ?? s.baseline_commit) }} ↗
+          </a>
+        } @else {
+          <span class="kpi-sub mono dim">{{ shortSha(s.final_commit ?? s.baseline_commit) }}</span>
+        }
+      </div>
+    </div>
+
+    @if (s.last_build_errors.length > 0) {
+      <div class="panel build-errors">
+        <div class="mono section-title">LAST BUILD ERRORS</div>
+        @for (e of s.last_build_errors; track $index) {
+          <div class="mono err-line">{{ e }}</div>
+        }
+      </div>
+    }
+
+    <div class="panel ledger">
+      <div class="ledger-head">
+        <h2>File Ledger</h2>
+        <input
+          class="input search"
+          type="text"
+          placeholder="Search files…"
+          [ngModel]="query()"
+          (ngModelChange)="query.set($event)"
+        />
+      </div>
+      <div class="chip-row filters">
+        @for (f of filters; track f.key) {
+          <button type="button" class="chip" [class.active]="filter() === f.key" (click)="setFilter(f.key)">
+            {{ f.label }}
+          </button>
+        }
+        <span class="dim mono count">{{ filteredFiles().length }} / {{ files().length }}</span>
+      </div>
+      <ul class="file-list">
+        @for (fs of filteredFiles(); track fs.file_path) {
+          <li>
+            <button type="button" class="file-row" (click)="toggleExpand(fs.file_path)">
+              <span class="chev mono">{{ expanded() === fs.file_path ? '▾' : '▸' }}</span>
+              <span class="mono path">{{ fs.file_path }}</span>
+              <span [class]="statusBadgeClass(fs)">{{ fs.status }}</span>
+              <span class="badge applied mono">{{ fs.applied_by ?? '—' }}</span>
+              <span class="mono dim attempts">×{{ fs.attempts }}</span>
+            </button>
+            @if (expanded() === fs.file_path) {
+              <div class="diagnostics">
+                @if (fs.errors_encountered.length > 0) {
+                  <div class="mono diag-title">RESOLVED COMPILER DIAGNOSTICS</div>
+                  @for (e of fs.errors_encountered; track $index) {
+                    <div class="mono diag-line">{{ e }}</div>
+                  }
+                } @else {
+                  <div class="dim diag-empty">No compiler errors were recorded for this file.</div>
+                }
+              </div>
+            }
+          </li>
+        }
+        @if (filteredFiles().length === 0) {
+          <li class="dim empty-row">No files match the current filter.</li>
+        }
+      </ul>
+    </div>
+
+    <div class="diff-title">
+      <h2>Git Diff Inspector</h2>
+      <span class="dim mono">{{ diffFileCount() }} files with diffs</span>
+    </div>
+    <app-diff-inspector [files]="files()" />
+  } @else {
+    <div class="panel empty-state">
+      <span class="badge badge-blue">No migration report yet</span>
+      <p class="dim">Run a migration from the Launcher to generate an audit report.</p>
+      <a class="btn btn-primary" routerLink="/launcher">Go to Launcher</a>
+    </div>
+  }
+</section>

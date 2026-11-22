@@ -1,0 +1,16 @@
+<header class="topnav">
+  <div class="topnav-left">
+    <a class="wordmark" routerLink="/launcher">
+      <span class="wordmark-glyph">◧</span>
+      <span>CodeRevive</span>
+    </a>
+    <nav class="tabs">
+      <a routerLink="/launcher" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: true }">Launcher</a>
+      <a [routerLink]="monitorLink()" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: false }">Pipeline Monitor</a>
+      <a routerLink="/reports/latest" routerLinkActive="active">Audit Report</a>
+    </nav>
+  </div>
+  <div class="topnav-right">
+    <span class="llm-badge mono">{{ llmLabel() }}</span>
+  </div>
+</header>

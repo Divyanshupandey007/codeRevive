@@ -101,7 +101,7 @@ Useful flags:
 - `--retry-budget N` — maximum sandbox repair rounds (default: `3`).
 - `--clean` — delete and re-clone/re-copy the isolated workspace.
 
-For programmatic or future frontend integration, call `app.orchestrator.service.run_migration_job` or run the backend API server (`python backend/app/main.py` exposing `GET /api/config`, `GET /api/migrations/latest`, and `POST /api/migrations`).
+For programmatic or frontend integration, run the FastAPI backend server (`python backend/app/main.py` or `uvicorn app.main:app --host 0.0.0.0 --port 8000`) exposing interactive OpenAPI docs at `/docs` and endpoints `GET /api/config`, `GET /api/migrations/latest`, `POST /api/migrations`, and background job tracking at `/api/migrations/jobs`.
 
 ---
 

@@ -1,0 +1,250 @@
+.report {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+}
+.head-left h1 {
+  margin: 0 0 2px;
+  font-size: 16px;
+}
+.head-left .mono {
+  font-size: 11px;
+}
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.repo-link {
+  font-size: 11px;
+  margin-right: 6px;
+}
+
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+}
+.kpi {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  min-width: 0;
+}
+.kpi-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+.kpi-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+}
+.kpi-sub {
+  font-size: 11px;
+}
+.kpi-branch {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.commit-link {
+  color: var(--blue);
+}
+
+.build-errors {
+  padding: 12px 18px;
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--red);
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+.err-line {
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.ledger-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px 0;
+}
+.ledger-head h2,
+.diff-title h2 {
+  margin: 0;
+  font-size: 14px;
+}
+.search {
+  max-width: 280px;
+}
+.filters {
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+}
+.count {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 18px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+.file-row:hover {
+  background: var(--surface-hover);
+}
+.chev {
+  color: var(--text-dim);
+  width: 12px;
+  flex: none;
+}
+.path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.applied {
+  text-transform: none;
+  letter-spacing: 0;
+}
+.attempts {
+  font-size: 11px;
+}
+.diagnostics {
+  padding: 10px 18px 14px 42px;
+  border-bottom: 1px solid var(--border);
+  background: var(--canvas);
+}
+.diag-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.diag-line {
+  font-size: 11px;
+  color: var(--red);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diag-empty {
+  font-size: 12px;
+}
+.empty-row {
+  padding: 16px 18px;
+  font-size: 12px;
+  list-style: none;
+}
+
+.diff-title {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-top: 8px;
+}
+.diff-title .mono {
+  font-size: 11px;
+}
+
+.loading {
+  padding: 32px 18px;
+}
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 18px;
+  text-align: center;
+  color: var(--text-muted);
+}
+.empty-state p {
+  margin: 0;
+  font-size: 13px;
+}
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-color: rgba(239, 68, 68, 0.4);
+}
+.error-banner .mono {
+  font-size: 12px;
+  color: var(--red);
+  word-break: break-word;
+}
+.spacer {
+  flex: 1;
+}
+
+@media (max-width: 1200px) {
+  .kpis {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .kpi:last-child {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 900px) {
+  .report-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .head-actions {
+    flex-wrap: wrap;
+  }
+  .kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .kpis {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .kpi:last-child {
+    grid-column: span 1;
+  }
+}

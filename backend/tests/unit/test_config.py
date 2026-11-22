@@ -41,6 +41,12 @@ def test_api_handlers_expose_single_source_config():
     assert req.repo_url == settings.repo_url
 
 
+def test_config_resolves_shipped_benchmark_fixture():
+    cfg = get_config_endpoint()
+    labels = [preset["label"] for preset in cfg["repository_presets"]]
+    assert labels == ["mybatis-spring-boot-jpetstore"]
+
+
 def test_database_environment_failure_detection():
     mysql_log = (
         "com.mysql.cj.jdbc.exceptions.CommunicationsException: "

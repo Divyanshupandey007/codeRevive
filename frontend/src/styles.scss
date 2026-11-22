@@ -1,0 +1,372 @@
+/* ============================================================
+   CodeRevive — Flat Dark Design System
+   Linear / GitHub Dark High Contrast inspired.
+   STRICT: no gradients, no neon glows, no backdrop blur, flat.
+   ============================================================ */
+
+:root {
+  --canvas: #09090b;
+  --surface: #111114;
+  --surface-hover: #18181d;
+  --border: #27272a;
+  --text: #f4f4f5;
+  --text-muted: #a1a1aa;
+  --text-dim: #71717a;
+  --accent: #f59e0b;
+  --accent-hover: #d97706;
+  --accent-tint: rgba(245, 158, 11, 0.1);
+  --green: #10b981;
+  --red: #ef4444;
+  --blue: #38bdf8;
+  --font-ui: 'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+a {
+  color: var(--blue);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--canvas);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border: 2px solid var(--canvas);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
+/* ---------- Surfaces ---------- */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #09090b;
+  font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.btn-ghost {
+  background: transparent;
+}
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* ---------- Badges / pills ---------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--surface);
+  text-transform: uppercase;
+}
+.badge-green {
+  color: var(--green);
+  border-color: rgba(16, 185, 129, 0.35);
+  background: rgba(16, 185, 129, 0.08);
+}
+.badge-red {
+  color: var(--red);
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+}
+.badge-amber {
+  color: var(--accent);
+  border-color: rgba(245, 158, 11, 0.35);
+  background: var(--accent-tint);
+}
+.badge-blue {
+  color: var(--blue);
+  border-color: rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+/* ---------- Chips ---------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.chip:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-tint);
+}
+
+/* ---------- Forms ---------- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.field > label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  outline: none;
+}
+.input:focus {
+  border-color: var(--accent);
+}
+.input::placeholder {
+  color: var(--text-dim);
+}
+select.input {
+  appearance: none;
+  cursor: pointer;
+  padding-right: 34px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' stroke='%23a1a1aa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+textarea.input {
+  resize: vertical;
+  min-height: 64px;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 10px;
+}
+.checkbox-row input[type='checkbox'] {
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border: 1px solid var(--border);
+  background: var(--canvas);
+  cursor: pointer;
+  position: relative;
+  flex: none;
+}
+.checkbox-row input[type='checkbox']:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.checkbox-row input[type='checkbox']:checked::after {
+  content: '✓';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: #09090b;
+  font-weight: 700;
+}
+
+/* ---------- Pulsing status dot (flat, no glow) ---------- */
+.dot {
+  width: 8px;
+  height: 8px;
+  background: var(--green);
+  flex: none;
+  animation: dot-pulse 1.6s ease-in-out infinite;
+}
+.dot.red {
+  background: var(--red);
+}
+.dot.amber {
+  background: var(--accent);
+}
+@keyframes dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* ---------- highlight.js — GitHub Dark High Contrast ---------- */
+.hljs {
+  background: transparent;
+  color: #e6edf3;
+}
+.hljs-comment,
+.hljs-quote {
+  color: #8b949e;
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-doctag,
+.hljs-template-tag {
+  color: #ff7b72;
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-meta .hljs-string {
+  color: #a5d6ff;
+}
+.hljs-number,
+.hljs-literal {
+  color: #79c0ff;
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-section {
+  color: #d2a8ff;
+}
+.hljs-title.class_,
+.hljs-type,
+.hljs-built_in {
+  color: #ffa657;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable {
+  color: #79c0ff;
+}
+.hljs-tag {
+  color: #7ee787;
+}
+.hljs-name {
+  color: #7ee787;
+}
+.hljs-meta {
+  color: #8b949e;
+}
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link {
+  color: #f2cc60;
+}
+.hljs-built_in,
+.hljs-builtin-name {
+  color: #ffa657;
+}
+.hljs-params {
+  color: #e6edf3;
+}
+.hljs-property {
+  color: #79c0ff;
+}
+.hljs-selector-id,
+.hljs-selector-class {
+  color: #d2a8ff;
+}
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: #ff7b72;
+}
+.hljs-addition {
+  color: #aff5b4;
+}
+.hljs-deletion {
+  color: #ffdcd7;
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 700;
+}

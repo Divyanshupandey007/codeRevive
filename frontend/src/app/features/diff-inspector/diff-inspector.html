@@ -1,0 +1,106 @@
+<div class="inspector">
+  <aside class="drawer panel">
+    <div class="drawer-head mono">MODIFIED FILES · {{ parsed().length }}</div>
+    @for (p of parsed(); track p.path) {
+      <button type="button" class="file-item" [class.selected]="p.path === selectedPath()" (click)="select(p.path)">
+        <div class="file-info">
+          <span class="file-name mono" [title]="p.path">{{ fileName(p.path) }}</span>
+          <span class="file-dir dim mono" [title]="p.path">{{ directoryPath(p.path) }}</span>
+        </div>
+        <span class="change-pill mono">
+          <span class="add">+{{ p.added }}</span>
+          <span class="del">−{{ p.deleted }}</span>
+        </span>
+      </button>
+    }
+    @if (parsed().length === 0) {
+      <div class="drawer-empty dim">No file diffs recorded for this run.</div>
+    }
+  </aside>
+
+  <div class="diff-pane panel">
+    @if (selected(); as sel) {
+      <div class="diff-sticky">
+        <span class="file-path mono" [title]="sel.path">{{ sel.path }}</span>
+        <span class="spacer"></span>
+        <div class="seg mono">
+          <button type="button" [class.on]="viewMode() === 'unified'" (click)="viewMode.set('unified')">Unified</button>
+          <button type="button" [class.on]="viewMode() === 'sxs'" (click)="viewMode.set('sxs')">Side-by-Side</button>
+        </div>
+        <button type="button" class="btn btn-ghost btn-sm" (click)="copyPatch()">
+          {{ copied() ? '✓ Copied!' : 'Copy Patch' }}
+        </button>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm chev"
+          (click)="collapsed.set(!collapsed())"
+          [title]="collapsed() ? 'Expand diff' : 'Collapse diff'"
+        >
+          {{ collapsed() ? '▸' : '▾' }}
+        </button>
+      </div>
+
+      @if (!collapsed()) {
+        <div class="diff-body">
+          @if (viewMode() === 'unified') {
+            @for (h of sel.hunks; track $index) {
+              <div class="hunk">
+                <div class="hunk-header mono">@@ -{{ h.oldStart }} +{{ h.newStart }} @@{{ h.header }}</div>
+                <table class="diff-table">
+                  <tbody>
+                    @for (l of h.lines; track $index) {
+                      <tr class="diff-line" [class.del]="l.type === 'del'" [class.ins]="l.type === 'ins'">
+                        <td class="gutter mono">{{ l.oldNo ?? '' }}</td>
+                        <td class="gutter mono">{{ l.newNo ?? '' }}</td>
+                        <td class="sign">{{ l.type === 'ins' ? '+' : l.type === 'del' ? '−' : '' }}</td>
+                        <td class="code"><code [innerHTML]="l.html"></code></td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+          } @else {
+            @for (h of sxs(); track $index) {
+              <div class="hunk">
+                <div class="hunk-header mono">@@ -{{ h.oldStart }} +{{ h.newStart }} @@{{ h.header }}</div>
+                <table class="diff-table sxs">
+                  <tbody>
+                    @for (row of h.rows; track $index) {
+                      <tr class="diff-line">
+                        <td class="gutter mono" [class.cell-del]="row.left?.type === 'del'" [class.cell-ins]="row.left?.type === 'ins'">
+                          {{ row.left?.oldNo ?? '' }}
+                        </td>
+                        <td class="sign" [class.cell-del]="row.left?.type === 'del'" [class.cell-ins]="row.left?.type === 'ins'">
+                          {{ row.left ? (row.left.type === 'ins' ? '+' : row.left.type === 'del' ? '−' : '') : '' }}
+                        </td>
+                        <td class="code" [class.cell-del]="row.left?.type === 'del'" [class.cell-ins]="row.left?.type === 'ins'">
+                          <code [innerHTML]="row.left?.html ?? ''"></code>
+                        </td>
+                        <td class="gutter mono" [class.cell-del]="row.right?.type === 'del'" [class.cell-ins]="row.right?.type === 'ins'">
+                          {{ row.right?.newNo ?? '' }}
+                        </td>
+                        <td class="sign" [class.cell-del]="row.right?.type === 'del'" [class.cell-ins]="row.right?.type === 'ins'">
+                          {{ row.right ? (row.right.type === 'ins' ? '+' : row.right.type === 'del' ? '−' : '') : '' }}
+                        </td>
+                        <td class="code" [class.cell-del]="row.right?.type === 'del'" [class.cell-ins]="row.right?.type === 'ins'">
+                          <code [innerHTML]="row.right?.html ?? ''"></code>
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+          }
+        </div>
+      }
+    } @else {
+      <div class="diff-empty dim">Select a file on the left to inspect its diff.</div>
+    }
+  </div>
+
+  @if (copied()) {
+    <div class="toast mono">✓ Copied!</div>
+  }
+</div>

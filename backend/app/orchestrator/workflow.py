@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from app.config import settings
 from app.guardrails.post_execution import (
@@ -228,6 +228,7 @@ class MigrationOrchestrator:
         maven_args: Optional[List[str]] = None,
         use_openrewrite: Optional[bool] = None,
         openrewrite_mode: Optional[str] = None,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ):
         self.repo_path = Path(repo_path)
         self._llm_provider = llm_provider
@@ -244,6 +245,7 @@ class MigrationOrchestrator:
             settings.default_retry_budget if retry_budget is None else retry_budget
         )
         self.maven_args = maven_args
+        self.progress_callback = progress_callback
         self.state = WorkflowState.INITIALIZING
         self._ast_parser: Optional[JavaAstParser] = None
         self._manifest_cache: Dict[str, Optional[JavaFileManifest]] = {}
@@ -264,6 +266,21 @@ class MigrationOrchestrator:
         if self.state != new_state:
             print(f"[orchestrator] {self.state.value} -> {new_state.value}")
         self.state = new_state
+        if self.progress_callback and new_state not in (
+            WorkflowState.COMPLETED,
+            WorkflowState.FAILED,
+        ):
+            messages = {
+                WorkflowState.INITIALIZING: "Initializing migration workflow",
+                WorkflowState.OPENREWRITE_PASS: "Running Pass 1 OpenRewrite migration",
+                WorkflowState.MIGRATING_FILE: "Applying deterministic file migrations",
+                WorkflowState.GENERATING_PATCH: "Generating an AI repair patch",
+                WorkflowState.VERIFYING_SANDBOX: "Running Maven verification in the Docker sandbox",
+                WorkflowState.REPAIRING: "Preparing an AI repair round",
+                WorkflowState.POST_INTEGRITY_CHECK: "Running post-migration integrity checks",
+                WorkflowState.COMMITING: "Committing validated migration changes",
+            }
+            self.progress_callback(f"{new_state.value}:{messages[new_state]}")
 
     def _request_patch_and_restore(
         self, prompt: str, target_file_path: str, source_code: str
