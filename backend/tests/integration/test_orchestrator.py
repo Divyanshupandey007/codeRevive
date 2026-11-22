@@ -154,11 +154,13 @@ public class SecurityConfig {
     )
 
     mock_llm = MockLLMProvider(llm_handler)
+    progress_events = []
     orchestrator = MigrationOrchestrator(
         repo_path=repo_path,
         llm_provider=mock_llm,
         docker_runner=fake_docker,
         use_openrewrite=True,
+        progress_callback=progress_events.append,
     )
     summary = orchestrator.run(report)
 
@@ -167,6 +169,12 @@ public class SecurityConfig {
     assert summary.openrewrite_used is True
     assert summary.final_commit != report.repo_info.baseline_sha
     assert fake_docker.calls == 3
+    assert progress_events[0].startswith("OPENREWRITE_PASS:")
+    assert any(event.startswith("VERIFYING_SANDBOX:") for event in progress_events)
+    assert any(event.startswith("REPAIRING:") for event in progress_events)
+    assert any(event.startswith("GENERATING_PATCH:") for event in progress_events)
+    assert any(event.startswith("POST_INTEGRITY_CHECK:") for event in progress_events)
+    assert progress_events[-1].startswith("COMMITING:")
 
     # OpenRewrite handled pom.xml and JwtAuthFilter.java deterministically in Pass 1 without calling LLM on them!
     assert "pom.xml" not in mock_llm.calls

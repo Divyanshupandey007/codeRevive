@@ -1,0 +1,162 @@
+<section class="launcher">
+  <div class="col form-col">
+    <div class="panel form-panel">
+      <div class="panel-head">
+        <h1>New Migration</h1>
+        <span class="dim">Spring Boot 2.x → 3.2.5 · Java 17</span>
+      </div>
+
+      <div class="field">
+        <label>Repository presets</label>
+        <div class="chip-row">
+          @for (p of presets(); track p.label) {
+            <button type="button" class="chip" [class.active]="repoUrl() === p.url" (click)="applyPreset(p)">
+              {{ p.label }}
+            </button>
+          }
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="repoUrl">Repository URL</label>
+        <div class="input-with-icon">
+          <input
+            id="repoUrl"
+            class="input"
+            type="text"
+            placeholder="https://github.com/org/repo.git"
+            [ngModel]="repoUrl()"
+            (ngModelChange)="repoUrl.set($event)"
+          />
+          @if (isRemoteRepo()) {
+            <a class="ext-link" [href]="repoOnGithub()" target="_blank" rel="noopener noreferrer" title="Open on GitHub" aria-label="Open repository on GitHub">↗</a>
+          }
+        </div>
+      </div>
+
+      <div class="field profile-field">
+        <div class="profile-heading">
+          <span class="profile-title">Validated Production Profile</span>
+          <span class="badge badge-green">Locked</span>
+        </div>
+        <dl class="profile-indicators">
+          <div class="profile-indicator">
+            <dt>Target Spring Boot</dt>
+            <dd class="mono">{{ profile.targetBoot }}</dd>
+          </div>
+          <div class="profile-indicator">
+            <dt>Target Java</dt>
+            <dd class="mono">{{ profile.targetJava }}</dd>
+          </div>
+        </dl>
+        <p class="profile-note dim">Locked to the validated migration configuration</p>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="branch">Migration branch</label>
+          <input
+            id="branch"
+            class="input"
+            type="text"
+            [ngModel]="branchName()"
+            (ngModelChange)="branchName.set($event)"
+          />
+        </div>
+        <div class="field">
+          <label for="retries">Retry budget</label>
+          <span class="field-help">Auto-repair attempts before rollback</span>
+          <input
+            id="retries"
+            class="input"
+            type="number"
+            min="0"
+            max="20"
+            [ngModel]="retryBudget()"
+            (ngModelChange)="retryBudget.set(+$event)"
+          />
+        </div>
+      </div>
+
+      @if (error()) {
+        <div class="form-error mono">{{ error() }}</div>
+      }
+
+      <button class="btn btn-primary launch-btn" [disabled]="submitting() || !repoUrl().trim()" (click)="submit()">
+        {{ submitting() ? 'Queuing…' : 'Launch Migration' }}
+      </button>
+    </div>
+  </div>
+
+  <div class="col history-col">
+    <div class="panel history-panel">
+      <div class="panel-head">
+        <h2>Migration History</h2>
+        <button class="btn btn-ghost btn-sm" (click)="refreshHistory()">Refresh</button>
+      </div>
+      <div class="history-summary">
+        <span class="summary-stat"><span class="dim mono">Jobs</span> <span class="mono">{{ jobsSummary().total }}</span></span>
+        <span class="summary-stat"><span class="dim mono">Completed</span> <span class="mono badge badge-green">{{ jobsSummary().completed }}</span></span>
+        <span class="summary-stat"><span class="dim mono">Failed</span> <span class="mono badge badge-red">{{ jobsSummary().failed }}</span></span>
+        <span class="summary-stat"><span class="dim mono">Running</span> <span class="mono badge badge-amber">{{ jobsSummary().running }}</span></span>
+      </div>
+      @if (historyError()) {
+        <div class="history-error mono" role="alert">{{ historyError() }}</div>
+      }
+      @if (jobs().length === 0) {
+        <div class="empty dim">No migration jobs yet. Launch one to see it here.</div>
+      } @else {
+        <div class="jobs-wrap">
+          <ul class="job-list">
+          @for (job of jobs(); track job.job_id) {
+            <li class="job-row">
+              <div class="job-main">
+                <span class="mono job-id">{{ job.job_id }}</span>
+                <span class="job-repo">{{ shortRepo(job.request.repo_url) }}</span>
+                <span class="dim job-meta mono">
+                  Boot {{ job.request.target_spring_boot }} · Java {{ job.request.target_java }}
+                </span>
+                <span class="dim job-meta mono">{{ job.created_at | date: 'MMM d, HH:mm:ss' }}</span>
+              </div>
+              <div class="job-side">
+                <span [class]="jobBadgeClass(job)">{{ job.status }}</span>
+                <a class="btn btn-ghost btn-sm" [routerLink]="['/jobs', job.job_id]">Open</a>
+                @if (job.status === 'COMPLETED') {
+                  <a class="btn btn-ghost btn-sm" [routerLink]="['/reports', job.job_id]">View Report</a>
+                }
+                @if (deleteCandidateId() === job.job_id) {
+                  <div class="delete-confirmation">
+                    <span class="dim">Delete?</span>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-danger"
+                      [disabled]="deletingJobId() === job.job_id"
+                      (click)="confirmDelete(job)"
+                    >
+                      {{ deletingJobId() === job.job_id ? 'Deleting…' : 'Confirm' }}
+                    </button>
+                    <button type="button" class="btn btn-ghost btn-sm" [disabled]="!!deletingJobId()" (click)="cancelDelete()">
+                      Cancel
+                    </button>
+                  </div>
+                } @else {
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-sm delete-btn"
+                    [disabled]="job.status === 'QUEUED' || job.status === 'RUNNING'"
+                    [title]="job.status === 'QUEUED' || job.status === 'RUNNING' ? 'Active jobs cannot be deleted' : 'Delete job from history'"
+                    [attr.aria-label]="'Delete job ' + job.job_id"
+                    (click)="requestDelete(job)"
+                  >
+                    Delete
+                  </button>
+                }
+              </div>
+            </li>
+          }
+        </ul>
+        </div>
+      }
+    </div>
+  </div>
+</section>

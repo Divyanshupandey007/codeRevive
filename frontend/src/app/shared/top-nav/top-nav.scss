@@ -1,0 +1,77 @@
+:host {
+  display: block;
+}
+
+.topnav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 52px;
+  padding: 0 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.topnav-left {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  min-width: 0;
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.wordmark:hover {
+  text-decoration: none;
+}
+.wordmark-glyph {
+  color: var(--accent);
+  font-size: 17px;
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.tabs a {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+}
+.tabs a:hover {
+  color: var(--text);
+  text-decoration: none;
+  background: var(--surface-hover);
+}
+.tabs a.active {
+  color: var(--text);
+  background: var(--surface-hover);
+  border-color: var(--border);
+}
+
+.topnav-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.llm-badge {
+  font-size: 11px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+}

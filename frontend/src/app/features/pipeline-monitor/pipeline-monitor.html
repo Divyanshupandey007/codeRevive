@@ -1,0 +1,130 @@
+<section class="monitor">
+  @if (!jobId) {
+    <div class="panel empty-state">
+      <span class="empty-state-icon" aria-hidden="true">◎</span>
+      <h1>No Active Migration</h1>
+      <p class="muted">Select a repository and launch a migration to track its progress in real time.</p>
+      <a class="btn btn-primary" routerLink="/launcher">Launch Migration</a>
+    </div>
+  } @else if (job(); as j) {
+    <header class="panel monitor-header">
+      <div class="head-left">
+        <span class="mono job-id">{{ j.job_id }}</span>
+        <span class="dim">{{ repoShort() }} · stage <span class="mono">{{ j.stage }}</span></span>
+        @if (stageHint(); as hint) {
+          <span class="stage-hint">{{ hint }}</span>
+        }
+      </div>
+      <div class="head-right">
+        <span
+          class="badge"
+          [class.badge-green]="j.status === 'COMPLETED'"
+          [class.badge-red]="j.status === 'FAILED'"
+          [class.badge-amber]="j.status === 'RUNNING'"
+          [class.badge-blue]="j.status === 'QUEUED'"
+          >{{ j.status }}</span
+        >
+        <button class="btn btn-ghost btn-sm" (click)="refresh()">Refresh</button>
+        @if (j.status === 'COMPLETED') {
+          <a class="btn btn-primary" [routerLink]="['/reports', j.job_id]">View Audit Report</a>
+        } @else {
+          <span class="btn btn-primary btn-disabled" aria-disabled="true">View Audit Report</span>
+        }
+      </div>
+    </header>
+
+    <ol class="stepper panel">
+      @for (step of steps; track step; let i = $index) {
+        <li
+          class="step"
+          [class.done]="completed() || activeStep() > i"
+          [class.active]="!failed() && !completed() && activeStep() === i"
+          [class.step-failed]="failedStep() === i"
+          [attr.aria-current]="!failed() && !completed() && activeStep() === i ? 'step' : null"
+        >
+          <span class="step-dot">
+            @if (completed() || activeStep() > i) {
+              <span class="check">✓</span>
+            } @else if (failedStep() === i) {
+              <span class="failure-mark" aria-label="Failed">!</span>
+            } @else if (!failed() && activeStep() === i) {
+              <span class="pulse"></span>
+            } @else {
+              <span class="idx">{{ i + 1 }}</span>
+            }
+          </span>
+          <span class="step-label">{{ step }}</span>
+        </li>
+      }
+    </ol>
+
+    <div class="panel metrics">
+      <div class="metric">
+        <span class="metric-label">Elapsed</span>
+        <span class="metric-value mono">{{ formatDuration(elapsedSeconds()) }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Active round</span>
+        <span class="metric-value mono">{{ activeRound() }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Target Boot</span>
+        <span class="metric-value mono">{{ j.request.target_spring_boot }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Target Java</span>
+        <span class="metric-value mono">{{ j.request.target_java }}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Commit</span>
+        <span class="metric-value mono">{{ commitShort() }}</span>
+      </div>
+    </div>
+
+    @if (j.error) {
+      <div class="panel error-banner" role="alert">
+        <span class="badge badge-red">ERROR</span>
+        <span class="mono">{{ j.error }}</span>
+      </div>
+    }
+
+    <div class="panel console">
+      <div class="console-head">
+        <span class="mono console-title">LIVE CONSOLE</span>
+        <span class="dim">{{ logLines().length }} events</span>
+        <span class="spacer"></span>
+        <button class="btn btn-ghost btn-sm" (click)="togglePause()">
+          {{ paused() ? '▶ Resume' : '⏸ Pause' }}
+        </button>
+      </div>
+      <div class="console-body mono" #console>
+        @for (entry of consoleLines(); track $index) {
+          <div class="log-line">
+            <span class="log-ts">{{ entry.line.timestamp | date: 'HH:mm:ss' }}</span>
+            <span class="log-tag" [class]="'log-tag ' + entry.line.tagClass">[{{ entry.line.tag }}]</span>
+            <span class="log-msg">{{ entry.line.message }}</span>
+          </div>
+          @if (entry.showLoader) {
+            <div class="log-line log-loading">
+              <span class="spinner" aria-hidden="true"></span>
+              <span class="log-msg dim mono">Working…</span>
+            </div>
+          }
+        }
+        @if (consoleLines().length === 0) {
+          <div class="log-line dim">Waiting for events…</div>
+        }
+      </div>
+    </div>
+  } @else if (loadError()) {
+    <div class="panel error-banner" role="alert">
+      <span class="badge badge-red">NOT FOUND</span>
+      <span class="mono">{{ loadError() }}</span>
+      <span class="spacer"></span>
+      <button class="btn btn-ghost btn-sm" (click)="refresh()">Retry</button>
+      <a class="btn btn-ghost btn-sm" routerLink="/launcher">← Launcher</a>
+    </div>
+  } @else {
+    <div class="panel loading dim">Loading job <span class="mono">{{ jobId }}</span>…</div>
+  }
+</section>

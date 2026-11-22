@@ -3,7 +3,7 @@ from typing import Any, Callable, Dict, Optional
 
 from pydantic import BaseModel, Field
 
-from app.config import settings
+from app.config import BACKEND_DIR, settings
 from app.ingestion.pipeline import IngestionPipeline
 from app.llm.base import LLMProvider
 from app.models.manifest import ProjectIngestionReport
@@ -31,9 +31,25 @@ class MigrationServiceResult(BaseModel):
     summary_path: str
 
 
+def _repository_presets() -> list[dict[str, str]]:
+    # Only the canonical, actively-maintained preset is shipped.
+    return [
+        {
+            "label": "mybatis-spring-boot-jpetstore",
+            "url": "https://github.com/kazuki43zoo/mybatis-spring-boot-jpetstore.git",
+        },
+    ]
+
+
 def get_active_config() -> Dict[str, Any]:
     """Return active non-secret migration defaults from backend/.env + config.py."""
+    llm_model_by_provider = {
+        "gemini": settings.gemini_model,
+        "nvidia": settings.nvidia_model,
+        "openrouter": settings.openrouter_model,
+    }
     return {
+        "repository_presets": _repository_presets(),
         "repo_url": settings.repo_url,
         "migration_branch_name": settings.migration_branch_name,
         "target_spring_boot_version": settings.target_spring_boot_version,
@@ -42,6 +58,7 @@ def get_active_config() -> Dict[str, Any]:
         "openrewrite_mode": settings.openrewrite_mode,
         "default_retry_budget": settings.default_retry_budget,
         "llm_provider": settings.llm_provider,
+        "llm_model": llm_model_by_provider.get(settings.llm_provider, settings.llm_provider),
         "workspace_root": str(settings.resolved_workspace_root),
     }
 
@@ -112,6 +129,7 @@ def run_migration_job(
         retry_budget=req.retry_budget,
         use_openrewrite=req.use_openrewrite,
         openrewrite_mode=req.openrewrite_mode,
+        progress_callback=progress_callback,
     )
     summary = orchestrator.run(ingestion_report)
 

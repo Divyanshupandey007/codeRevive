@@ -10,15 +10,18 @@ import mimetypes
 import os
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from starlette.datastructures import Headers
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 import uvicorn
 
 backend_root = Path(__file__).resolve().parents[1]
@@ -26,21 +29,14 @@ if str(backend_root) not in sys.path:
     sys.path.insert(0, str(backend_root))
 
 from app.api.jobs import JobConflictError
-from app.api.routes import (
-    api_router,
-    get_config_endpoint,
-    get_latest_report_endpoint,
-    health_check,
-    start_migration_endpoint,
-)
+from app.api.router import normalize_path
+from app.api.routes import api_router
 from app.config import settings
 from app.ingestion.pipeline import UnsupportedRepositoryError
 from app.llm.base import LLMProviderError
 from app.sandbox.docker_runner import ContainerExecutionError
 
 logger = logging.getLogger("coderevive.api")
-
-MAX_REQUEST_BODY_BYTES = settings.max_request_body_bytes
 
 _STATIC_ASSET_EXTENSIONS = frozenset(
     {
@@ -66,32 +62,11 @@ _STATIC_ASSET_EXTENSIONS = frozenset(
 )
 
 
-def normalize_path(raw_path: str, version_aliases: Iterable[str] = ("/api/v1",)) -> str:
-    """Extract, normalize, and canonicalize request path (strip query, collapse/trim slashes, alias /api/v1)."""
-    parsed = urlsplit(raw_path or "/")
-    path = parsed.path or "/"
-    while "//" in path:
-        path = path.replace("//", "/")
-    if len(path) > 1 and path.endswith("/"):
-        path = path.rstrip("/")
-    for alias in version_aliases:
-        clean_alias = alias.rstrip("/")
-        if path == clean_alias:
-            return "/api"
-        if path.startswith(clean_alias + "/"):
-            return "/api" + path[len(clean_alias) :]
-    return path
-
-
 def _resolve_spa_asset(
     raw_path: str,
     dist_dir: Optional[Path],
 ) -> Optional[Tuple[int, bytes, str, Dict[str, str]]]:
-    """
-    Serve compiled Angular static assets and HTML5 PathLocationStrategy fallback.
-
-    Never intercepts `/api` or `/api/*` paths (including `/api/v1/*` alias).
-    """
+    """Serve compiled Angular static assets and HTML5 PathLocationStrategy fallback."""
     if dist_dir is None:
         return None
 
@@ -122,316 +97,291 @@ def _resolve_spa_asset(
                 else "public, max-age=31536000, immutable"
             )
             return (
-                int(HTTPStatus.OK),
+                int(status.HTTP_200_OK),
                 candidate.read_bytes(),
                 mime,
                 {"Cache-Control": cache},
             )
         if Path(rel_part).suffix.lower() in _STATIC_ASSET_EXTENSIONS:
-            return (
-                int(HTTPStatus.NOT_FOUND),
-                json.dumps({"detail": "Static asset not found", "path": clean_path}).encode("utf-8"),
-                "application/json; charset=utf-8",
-                {"Cache-Control": "no-store"},
-            )
+            return None
 
     return (
-        int(HTTPStatus.OK),
+        int(status.HTTP_200_OK),
         index_file.read_bytes(),
         "text/html; charset=utf-8",
         {"Cache-Control": "no-cache"},
     )
 
 
-async def _send_asgi_bytes(
-    send: Callable[..., Any],
-    method: str,
-    status_code: int,
-    body: bytes,
-    content_type: str,
-    extra_headers: Optional[Dict[str, str]] = None,
-    request_id: Optional[str] = None,
-) -> None:
-    headers: List[Tuple[bytes, bytes]] = [
-        (b"content-type", content_type.encode("latin-1")),
-        (b"content-length", str(len(body)).encode("latin-1")),
-        (b"x-content-type-options", b"nosniff"),
-    ]
-    if request_id:
-        headers.append((b"x-request-id", request_id.encode("latin-1")))
-    if extra_headers:
-        for k, v in extra_headers.items():
-            headers.append((k.lower().encode("latin-1"), v.encode("latin-1")))
-    await send({"type": "http.response.start", "status": int(status_code), "headers": headers})
-    await send(
-        {
-            "type": "http.response.body",
-            "body": b"" if method == "HEAD" else body,
-            "more_body": False,
-        }
-    )
+class CustomCORSMiddleware(CORSMiddleware):
+    """CORS middleware attaching X-Request-ID to preflight responses."""
+
+    def preflight_response(self, request_headers: Headers) -> Response:
+        response = super().preflight_response(request_headers)
+        if response.status_code == 200:
+            req_id = request_headers.get("x-request-id") or uuid4().hex[:12]
+            response.headers["X-Request-ID"] = req_id
+        return response
 
 
-class _PathNormalizationMiddleware:
-    """Normalize duplicate/trailing slashes and /api/v1 aliases before FastAPI routing."""
+class PathNormalizationAndSPAMiddleware:
+    """ASGI middleware to canonicalize paths (/api/v1/ -> /api/, collapse slashes) and serve SPA assets."""
 
-    def __init__(self, app: Callable[..., Any]) -> None:
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(
-        self, scope: Dict[str, Any], receive: Callable[..., Any], send: Callable[..., Any]
-    ) -> None:
-        if scope["type"] == "http":
-            normalized = normalize_path(scope.get("path", "/"))
-            scope = dict(scope)
-            scope["path"] = normalized
-            scope["raw_path"] = normalized.encode("latin-1")
-        await self.app(scope, receive, send)
-
-
-class _RequestGuardAndSPAMiddleware:
-    """Enforce body size limits, security/request-id headers, and optional Angular SPA fallback."""
-
-    def __init__(self, app: Callable[..., Any]) -> None:
-        self.app = app
-
-    async def __call__(
-        self, scope: Dict[str, Any], receive: Callable[..., Any], send: Callable[..., Any]
-    ) -> None:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        method = str(scope.get("method", "GET")).upper()
-        raw_path = str(scope.get("path", "/"))
-        clean_path = normalize_path(raw_path)
+        raw_path = scope.get("path", "/")
+        norm_path = normalize_path(raw_path)
 
-        req_headers: Dict[str, str] = {}
-        for k, v in scope.get("headers", []):
-            key = k.decode("latin-1").lower() if isinstance(k, (bytes, bytearray)) else str(k).lower()
-            val = v.decode("latin-1") if isinstance(v, (bytes, bytearray)) else str(v)
-            req_headers[key] = val
+        # Handle HEAD requests by routing as GET and stripping body per RFC 7231
+        is_head = scope.get("method") == "HEAD"
+        if is_head:
+            scope["method"] = "GET"
 
-        request_id = req_headers.get("x-request-id") or uuid4().hex[:12]
+        # Default Content-Type to application/json for POST/PUT/PATCH if body is present but header missing
+        if scope.get("method") in ("POST", "PUT", "PATCH"):
+            raw_headers = list(scope.get("headers", []))
+            has_ct = any(k.lower() == b"content-type" for k, v in raw_headers)
+            has_cl = any(k.lower() == b"content-length" and v != b"0" for k, v in raw_headers)
+            if not has_ct and has_cl:
+                raw_headers.append((b"content-type", b"application/json"))
+                scope["headers"] = raw_headers
 
-        # 1. Serve Angular SPA assets / deep-link index.html when frontend_dist_dir is configured
-        if method in ("GET", "HEAD"):
+        # Angular SPA handling
+        method = scope.get("method", "GET").upper()
+        if method in ("GET", "HEAD") and settings.frontend_dist_dir:
             spa = _resolve_spa_asset(raw_path, settings.frontend_dist_dir)
             if spa is not None:
-                spa_status, spa_bytes, spa_mime, spa_headers = spa
-                await _send_asgi_bytes(
-                    send=send,
-                    method=method,
-                    status_code=spa_status,
-                    body=spa_bytes,
-                    content_type=spa_mime,
-                    extra_headers=spa_headers,
-                    request_id=request_id,
-                )
+                spa_status, raw_bytes, mime, spa_headers = spa
+                body = b"" if is_head else raw_bytes
+                response_headers = [
+                    (b"content-type", mime.encode("latin-1")),
+                    (b"content-length", str(len(raw_bytes)).encode("latin-1")),
+                    (b"x-content-type-options", b"nosniff"),
+                ]
+                for hk, hv in spa_headers.items():
+                    response_headers.append((hk.lower().encode("latin-1"), hv.encode("latin-1")))
+
+                await send({
+                    "type": "http.response.start",
+                    "status": spa_status,
+                    "headers": response_headers,
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": body,
+                    "more_body": False,
+                })
                 return
 
-        # 2. Enforce Content-Length & streaming body size bounds
-        max_bytes = max(MAX_REQUEST_BODY_BYTES, settings.max_request_body_bytes)
-        if "content-length" in req_headers:
+        # Rewrite path in ASGI scope for standard routing
+        scope["path"] = norm_path
+
+        if is_head:
+            async def head_send(message: Dict[str, Any]) -> None:
+                if message["type"] == "http.response.body":
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                else:
+                    await send(message)
+
+            await self.app(scope, receive, head_send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+class RequestHeadersAndLimitMiddleware(BaseHTTPMiddleware):
+    """Enforces body limits and injects security headers and X-Request-ID."""
+
+    def __init__(self, app: ASGIApp, max_body_bytes: int) -> None:
+        super().__init__(app)
+        self.max_body_bytes = max_body_bytes
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        req_id = request.headers.get("X-Request-ID") or uuid4().hex[:12]
+
+        # Enforce request body size limit
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
             try:
-                content_length = int(req_headers["content-length"])
+                length = int(content_length)
+                if length > self.max_body_bytes:
+                    return JSONResponse(
+                        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                        content={"detail": f"Request body exceeds {self.max_body_bytes} bytes."},
+                        headers={"X-Request-ID": req_id, "X-Content-Type-Options": "nosniff"},
+                    )
+                if length < 0:
+                    return JSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content={"detail": "Negative Content-Length header."},
+                        headers={"X-Request-ID": req_id, "X-Content-Type-Options": "nosniff"},
+                    )
             except ValueError:
-                err = json.dumps({"detail": "Invalid Content-Length header."}, indent=2).encode("utf-8")
-                await _send_asgi_bytes(
-                    send, method, HTTPStatus.BAD_REQUEST, err,
-                    "application/json; charset=utf-8", {"Cache-Control": "no-store"}, request_id
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid Content-Length header."},
+                    headers={"X-Request-ID": req_id, "X-Content-Type-Options": "nosniff"},
                 )
-                return
-            if content_length < 0:
-                err = json.dumps({"detail": "Negative Content-Length header."}, indent=2).encode("utf-8")
-                await _send_asgi_bytes(
-                    send, method, HTTPStatus.BAD_REQUEST, err,
-                    "application/json; charset=utf-8", {"Cache-Control": "no-store"}, request_id
-                )
-                return
-            if content_length > max_bytes:
-                err = json.dumps(
-                    {"detail": f"Request body exceeds {max_bytes} bytes."}, indent=2
-                ).encode("utf-8")
-                await _send_asgi_bytes(
-                    send, method, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, err,
-                    "application/json; charset=utf-8", {"Cache-Control": "no-store"}, request_id
-                )
-                return
 
-        # Wrap receive to cap chunked/streamed payloads as well
-        bytes_seen = 0
-
-        async def guarded_receive() -> Dict[str, Any]:
-            nonlocal bytes_seen
-            message = await receive()
-            if message.get("type") == "http.request":
-                chunk = message.get("body", b"")
-                bytes_seen += len(chunk)
-                if bytes_seen > max_bytes:
-                    raise _PayloadTooLargeError(max_bytes)
-            return message
-
-        # Support HEAD cleanly against FastAPI GET routes without polluting OpenAPI schema
-        downstream_scope = scope
-        if method == "HEAD":
-            downstream_scope = dict(scope)
-            downstream_scope["method"] = "GET"
-
-        # Inject security & cache headers onto downstream responses (and strip HEAD body)
-        async def wrapped_send(message: Dict[str, Any]) -> None:
-            if message["type"] == "http.response.start":
-                headers = list(message.get("headers", []))
-                existing_keys = {k.lower() for k, _ in headers}
-                if b"x-content-type-options" not in existing_keys:
-                    headers.append((b"x-content-type-options", b"nosniff"))
-                if b"x-request-id" not in existing_keys:
-                    headers.append((b"x-request-id", request_id.encode("latin-1")))
-                if (clean_path == "/api" or clean_path.startswith("/api/")) and b"cache-control" not in existing_keys:
-                    headers.append((b"cache-control", b"no-store"))
-                message = {**message, "headers": headers}
-            elif message["type"] == "http.response.body" and method == "HEAD":
-                message = {**message, "body": b""}
-            await send(message)
-
-        try:
-            await self.app(downstream_scope, guarded_receive, wrapped_send)
-        except _PayloadTooLargeError as exc:
-            err = json.dumps(
-                {"detail": f"Request body exceeds {exc.limit} bytes."}, indent=2
-            ).encode("utf-8")
-            await _send_asgi_bytes(
-                send, method, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, err,
-                "application/json; charset=utf-8", {"Cache-Control": "no-store"}, request_id
-            )
-
-
-class _PayloadTooLargeError(Exception):
-    def __init__(self, limit: int) -> None:
-        super().__init__(f"Request body exceeds {limit} bytes.")
-        self.limit = limit
+        response: Response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
 
 def create_app() -> FastAPI:
-    """Create the production FastAPI application with CORS, validation handlers, and routing."""
-    fastapi_app = FastAPI(
+    """Build and configure the production FastAPI application."""
+    app_instance = FastAPI(
         title="CodeRevive Migration Engine API",
-        description="Autonomous Spring Boot 2.x to 3.x migration engine API.",
+        description="Automated Spring Boot 2.x to 3.x Migration Engine",
         version="1.0.0",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",
     )
 
-    fastapi_app.include_router(api_router)
+    # -----------------------------------------------------------------------
+    # Exception Handlers
+    # -----------------------------------------------------------------------
 
-    @fastapi_app.exception_handler(RequestValidationError)
-    async def request_validation_exception_handler(
-        _request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
-        errors = exc.errors()
-        for err in errors:
-            err_type = err.get("type", "")
-            loc = err.get("loc", ())
-            if err_type == "json_invalid":
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={"detail": f"Invalid JSON body: {err.get('msg', 'malformed JSON')}"},
-                )
-            if loc == ("body",) and err_type in ("model_type", "model_attributes_type", "dict_type"):
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={"detail": "Request body must be a JSON object."},
-                )
-        unprocessable_status = getattr(
-            status,
-            "HTTP_422_UNPROCESSABLE_CONTENT",
-            getattr(status, "HTTP_422_UNPROCESSABLE_ENTITY", 422),
-        )
-        return JSONResponse(
-            status_code=unprocessable_status,
-            content={"detail": errors},
-        )
-
-    @fastapi_app.exception_handler(ValidationError)
-    async def pydantic_validation_exception_handler(
-        _request: Request, exc: ValidationError
-    ) -> JSONResponse:
-        unprocessable_status = getattr(
-            status,
-            "HTTP_422_UNPROCESSABLE_CONTENT",
-            getattr(status, "HTTP_422_UNPROCESSABLE_ENTITY", 422),
-        )
-        return JSONResponse(
-            status_code=unprocessable_status,
-            content={"detail": exc.errors()},
-        )
-
-    @fastapi_app.exception_handler(UnsupportedRepositoryError)
-    async def unsupported_repo_exception_handler(
-        _request: Request, exc: UnsupportedRepositoryError
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"detail": str(exc)},
-        )
-
-    @fastapi_app.exception_handler(JobConflictError)
-    async def job_conflict_exception_handler(
-        _request: Request, exc: JobConflictError
-    ) -> JSONResponse:
+    @app_instance.exception_handler(JobConflictError)
+    async def job_conflict_handler(_request: Request, exc: JobConflictError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},
         )
 
-    @fastapi_app.exception_handler(ValueError)
-    @fastapi_app.exception_handler(LLMProviderError)
-    @fastapi_app.exception_handler(ContainerExecutionError)
-    async def domain_error_exception_handler(
-        _request: Request, exc: Exception
-    ) -> JSONResponse:
+    @app_instance.exception_handler(UnsupportedRepositoryError)
+    async def unsupported_repo_handler(_request: Request, exc: UnsupportedRepositoryError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": str(exc)},
+        )
+
+    @app_instance.exception_handler(LLMProviderError)
+    async def llm_error_handler(_request: Request, exc: LLMProviderError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": str(exc)},
         )
 
-    @fastapi_app.exception_handler(Exception)
-    async def unhandled_exception_handler(
-        request: Request, exc: Exception
-    ) -> JSONResponse:  # pragma: no cover - defensive fallback
-        logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    @app_instance.exception_handler(ContainerExecutionError)
+    async def container_error_handler(_request: Request, exc: ContainerExecutionError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": str(exc)},
+        )
+
+    @app_instance.exception_handler(RequestValidationError)
+    async def validation_exception_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        for err in exc.errors():
+            if err.get("type") in ("json_invalid", "value_error.jsondecode"):
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": f"Invalid JSON body: {err.get('msg', 'Invalid JSON')}"},
+                )
+            if err.get("type") in ("dict_type", "model_type", "model_attributes_type") and (
+                not err.get("loc") or tuple(err.get("loc", ())) in (("body",), ("body", "payload"))
+            ):
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Request body must be a JSON object."},
+                )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": exc.errors()},
+        )
+
+    @app_instance.exception_handler(ValidationError)
+    async def pydantic_validation_handler(_request: Request, exc: ValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": exc.errors()},
+        )
+
+    @app_instance.exception_handler(json.JSONDecodeError)
+    async def json_decode_handler(_request: Request, exc: json.JSONDecodeError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": f"Invalid JSON body: {exc}"},
+        )
+
+    @app_instance.exception_handler(404)
+    async def not_found_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        clean_path = normalize_path(str(request.url.path))
+        detail = exc.detail if isinstance(exc.detail, str) and exc.detail != "Not Found" else "Not found"
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": detail, "path": clean_path},
+        )
+
+    @app_instance.exception_handler(405)
+    async def method_not_allowed_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        headers = dict(exc.headers or {})
+        allow = headers.get("allow") or headers.get("Allow") or "GET, HEAD"
+        allowed_list = [m.strip() for m in allow.split(",") if m.strip()]
+        if "GET" in allowed_list and "HEAD" not in allowed_list:
+            allowed_list.append("HEAD")
+        headers["Allow"] = ", ".join(allowed_list)
+        clean_path = normalize_path(str(request.url.path))
+        return JSONResponse(
+            status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+            content={
+                "detail": f"Method '{request.method}' not allowed for '{clean_path}'.",
+                "allowed_methods": allowed_list,
+            },
+            headers=headers,
+        )
+
+    @app_instance.exception_handler(Exception)
+    async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("Unhandled error processing %s %s", request.method, request.url.path)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": f"Internal server error: {exc}"},
         )
 
-    # Starlette executes middlewares in reverse order of registration:
-    # Request -> CORSMiddleware -> _RequestGuardAndSPAMiddleware -> _PathNormalizationMiddleware -> FastAPI Router
-    fastapi_app.add_middleware(_PathNormalizationMiddleware)
-    fastapi_app.add_middleware(_RequestGuardAndSPAMiddleware)
+    # -----------------------------------------------------------------------
+    # Routers
+    # -----------------------------------------------------------------------
+    app_instance.include_router(api_router)
 
-    allowed_origins = settings.cors_allowed_origins
-    if allowed_origins:
-        allow_creds = (
-            False
-            if "*" in allowed_origins
-            else settings.cors_allow_credentials
-        )
-        fastapi_app.add_middleware(
-            CORSMiddleware,
-            allow_origins=allowed_origins,
-            allow_credentials=allow_creds,
+    # -----------------------------------------------------------------------
+    # Middlewares (applied in reverse order of addition)
+    # -----------------------------------------------------------------------
+    app_instance.add_middleware(
+        RequestHeadersAndLimitMiddleware,
+        max_body_bytes=settings.max_request_body_bytes,
+    )
+
+    if settings.cors_allowed_origins:
+        app_instance.add_middleware(
+            CustomCORSMiddleware,
+            allow_origins=settings.cors_allowed_origins,
+            allow_credentials=settings.cors_allow_credentials,
             allow_methods=settings.cors_allowed_methods,
             allow_headers=settings.cors_allowed_headers,
-            expose_headers=["Location", "X-Request-ID"],
             max_age=settings.cors_max_age_seconds,
+            expose_headers=["Location", "X-Request-ID"],
         )
 
-    return fastapi_app
+    app_instance.add_middleware(PathNormalizationAndSPAMiddleware)
+
+    return app_instance
 
 
 app = create_app()
+
+
+# ---------------------------------------------------------------------------
+# Compatibility Bridge Server for tests and synchronous callers
+# ---------------------------------------------------------------------------
 
 
 class _CodeReviveHTTPServer(ThreadingHTTPServer):
@@ -440,121 +390,132 @@ class _CodeReviveHTTPServer(ThreadingHTTPServer):
 
 
 class _StdlibApiHandler(BaseHTTPRequestHandler):
-    """Backwards-compatible stdlib HTTP handler delegating directly to the FastAPI ASGI app."""
+    """Bridges HTTP connections to the FastAPI application."""
 
-    asgi_app: FastAPI = app
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.info("%s - %s", self.address_string(), format % args)
 
-    def _dispatch_to_fastapi(self, method: str) -> None:
-        raw_length = self.headers.get("Content-Length")
+    def _handle_asgi(self) -> None:
+        raw_path = self.path or "/"
+        parsed = urlsplit(raw_path)
+        path = parsed.path or "/"
+        query_string = parsed.query.encode("latin-1") if parsed.query else b""
+
+        headers: List[Tuple[bytes, bytes]] = []
+        content_length = None
+        for k, v in self.headers.items():
+            k_lower = k.lower()
+            if k_lower == "content-length":
+                try:
+                    content_length = int(v)
+                except ValueError:
+                    content_length = -1
+            headers.append((k_lower.encode("latin-1"), v.encode("latin-1")))
+
         body_bytes = b""
-        oversized_or_invalid_length = False
+        if content_length is not None:
+            if content_length < 0:
+                self.send_response(status.HTTP_400_BAD_REQUEST)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b'{"detail": "Negative Content-Length header."}')
+                return
+            if content_length > settings.max_request_body_bytes:
+                self.send_response(status.HTTP_413_CONTENT_TOO_LARGE)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(
+                    f'{{"detail": "Request body exceeds {settings.max_request_body_bytes} bytes."}}'.encode()
+                )
+                return
+            if content_length > 0:
+                body_bytes = self.rfile.read(content_length)
 
-        if raw_length is not None:
-            try:
-                parsed_len = int(raw_length)
-            except ValueError:
-                oversized_or_invalid_length = True
-                parsed_len = 0
-            max_bytes = max(MAX_REQUEST_BODY_BYTES, settings.max_request_body_bytes)
-            if parsed_len < 0 or parsed_len > max_bytes:
-                oversized_or_invalid_length = True
-            elif parsed_len > 0:
-                body_bytes = self.rfile.read(parsed_len)
-
-        parsed_url = urlsplit(self.path or "/")
-        raw_headers: List[Tuple[bytes, bytes]] = [
-            (k.lower().encode("latin-1"), v.encode("latin-1"))
-            for k, v in self.headers.items()
-        ]
-        scope: Dict[str, Any] = {
+        scope: Scope = {
             "type": "http",
-            "asgi": {"version": "3.0"},
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
             "http_version": "1.1",
-            "method": method.upper(),
-            "scheme": "http",
-            "path": unquote(parsed_url.path or "/"),
-            "raw_path": (parsed_url.path or "/").encode("latin-1"),
-            "query_string": (parsed_url.query or "").encode("latin-1"),
-            "root_path": "",
-            "headers": raw_headers,
+            "method": self.command,
+            "path": path,
+            "raw_path": path.encode("latin-1"),
+            "query_string": query_string,
+            "headers": headers,
             "client": self.client_address,
             "server": self.server.server_address,
+            "scheme": "http",
         }
 
-        response_status = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+        body_sent = False
+        response_started = False
+        response_status = 200
         response_headers: List[Tuple[bytes, bytes]] = []
         response_chunks: List[bytes] = []
-        body_sent = False
+        disconnect_event = asyncio.Event()
 
         async def receive() -> Dict[str, Any]:
             nonlocal body_sent
             if not body_sent:
                 body_sent = True
                 return {"type": "http.request", "body": body_bytes, "more_body": False}
+            await disconnect_event.wait()
             return {"type": "http.disconnect"}
 
         async def send(message: Dict[str, Any]) -> None:
-            nonlocal response_status, response_headers
+            nonlocal response_started, response_status, response_headers
             if message["type"] == "http.response.start":
-                response_status = int(message["status"])
-                response_headers = list(message.get("headers", []))
+                response_started = True
+                response_status = message["status"]
+                response_headers = message.get("headers", [])
             elif message["type"] == "http.response.body":
-                chunk = message.get("body", b"")
-                if chunk:
-                    response_chunks.append(chunk)
+                response_chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    disconnect_event.set()
 
-        asyncio.run(self.asgi_app(scope, receive, send))
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(app(scope, receive, send))
+        finally:
+            loop.close()
 
-        full_body = b"".join(response_chunks)
         self.send_response(response_status)
-
-        has_content_length = False
         for hk, hv in response_headers:
-            key_str = hk.decode("latin-1")
-            val_str = hv.decode("latin-1")
-            if key_str.lower() == "content-length":
-                has_content_length = True
-            self.send_header(key_str, val_str)
-
-        if not has_content_length:
-            self.send_header("Content-Length", str(len(full_body)))
-
-        if oversized_or_invalid_length:
-            self.close_connection = True
-            self.send_header("Connection", "close")
-
+            self.send_header(hk.decode("latin-1"), hv.decode("latin-1"))
         self.end_headers()
-        if method.upper() != "HEAD" and full_body:
-            self.wfile.write(full_body)
+
+        if self.command != "HEAD":
+            full_body = b"".join(response_chunks)
+            if full_body:
+                self.wfile.write(full_body)
         self.wfile.flush()
 
-    def do_OPTIONS(self) -> None:
-        self._dispatch_to_fastapi("OPTIONS")
-
     def do_GET(self) -> None:
-        self._dispatch_to_fastapi("GET")
+        self._handle_asgi()
 
     def do_HEAD(self) -> None:
-        self._dispatch_to_fastapi("HEAD")
+        self._handle_asgi()
 
     def do_POST(self) -> None:
-        self._dispatch_to_fastapi("POST")
+        self._handle_asgi()
 
     def do_PUT(self) -> None:
-        self._dispatch_to_fastapi("PUT")
+        self._handle_asgi()
 
     def do_PATCH(self) -> None:
-        self._dispatch_to_fastapi("PATCH")
+        self._handle_asgi()
 
     def do_DELETE(self) -> None:
-        self._dispatch_to_fastapi("DELETE")
+        self._handle_asgi()
+
+    def do_OPTIONS(self) -> None:
+        self._handle_asgi()
 
 
 def serve(host: Optional[str] = None, port: Optional[int] = None) -> None:
+    """Production server startup using uvicorn."""
     resolved_host = host or settings.api_host
     if port is not None:
         resolved_port = port
@@ -562,11 +523,12 @@ def serve(host: Optional[str] = None, port: Optional[int] = None) -> None:
         env_port = os.environ.get("PORT")
         resolved_port = int(env_port) if env_port else settings.api_port
 
-    uvicorn.run(app, host=resolved_host, port=resolved_port)
+    print(f"CodeRevive API listening on http://{resolved_host}:{resolved_port}")
+    uvicorn.run("app.main:app", host=resolved_host, port=resolved_port, log_level="info")
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CodeRevive Backend FastAPI Server")
+    parser = argparse.ArgumentParser(description="CodeRevive Backend API Server")
     parser.add_argument("--host", default=None, help=f"Bind host (default: {settings.api_host})")
     parser.add_argument("--port", type=int, default=None, help=f"Bind port (default: {settings.api_port})")
     return parser.parse_args()
