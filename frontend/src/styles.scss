@@ -115,6 +115,16 @@ a:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
 }
+.btn-danger {
+  background: var(--red);
+  border-color: var(--red);
+  color: #09090b;
+  font-weight: 600;
+}
+.btn-danger:hover:not(:disabled) {
+  background: #b91c1c;
+  border-color: #b91c1c;
+}
 .btn-ghost {
   background: transparent;
 }

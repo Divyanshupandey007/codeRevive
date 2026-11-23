@@ -126,18 +126,38 @@ export class AuditReport {
     }
   }
 
+  readonly copiedSha = signal(false);
+
+  /** True only when the migration produced a distinct local commit not on GitHub. */
+  readonly hasLocalMigrationCommit = computed(() => {
+    const s = this.summary();
+    return Boolean(s?.final_commit && s.final_commit !== s.baseline_commit);
+  });
+
+  /** GitHub URL for the baseline (upstream) commit — always safe to link externally. */
+  baselineCommitUrl(): string {
+    const s = this.summary();
+    if (!s || !this.isRemoteRepo() || !s.baseline_commit) {
+      return '';
+    }
+    return `${repoWebUrl(s.repo_url)}/commit/${s.baseline_commit}`;
+  }
+
+  /** Copy the local final_commit SHA to the clipboard. */
+  copyFinalSha(): void {
+    const sha = this.summary()?.final_commit;
+    if (!sha || !navigator.clipboard) {
+      return;
+    }
+    navigator.clipboard.writeText(sha).then(() => {
+      this.copiedSha.set(true);
+      setTimeout(() => this.copiedSha.set(false), 1500);
+    });
+  }
+
   isRemoteRepo(): boolean {
     const summary = this.summary();
     return summary ? isRemoteRepoUrl(summary.repo_url) : false;
-  }
-
-  commitUrl(): string {
-    const s = this.summary();
-    if (!s || !this.isRemoteRepo()) {
-      return '';
-    }
-    const sha = s.final_commit ?? s.baseline_commit;
-    return `${repoWebUrl(s.repo_url)}/commit/${sha}`;
   }
 
   githubRepoUrl(): string {

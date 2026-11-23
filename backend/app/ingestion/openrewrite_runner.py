@@ -596,7 +596,7 @@ class OpenRewriteRunner:
                 baseline = repo.git.show(f"HEAD:{rel}")
             except Exception:
                 continue
-            if "new Pbkdf2PasswordEncoder" in baseline:
+            if "new Pbkdf2PasswordEncoder" in baseline or "defaultsForSpringSecurity_v5_5" in baseline:
                 updated = current.replace(
                     "defaultsForSpringSecurity_v5_8()",
                     "defaultsForSpringSecurity_v5_5()",

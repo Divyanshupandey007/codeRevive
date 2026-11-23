@@ -305,6 +305,58 @@ def test_delete_running_job_returns_409_conflict(monkeypatch):
         gate.set()
 
 
+def test_cancel_running_migration_job(monkeypatch):
+    gate = threading.Event()
+
+    def blocking_run(request, progress_callback=None, **_kwargs):
+        gate.wait(timeout=5)
+        return _make_fake_service_result(request.repo_url)
+
+    monkeypatch.setattr("app.api.jobs.run_migration_job", blocking_run)
+    monkeypatch.setattr("app.api.routes.run_migration_job", blocking_run)
+
+    client = TestClient(app)
+    try:
+        create_resp = client.post("/api/migrations/jobs", json={})
+        assert create_resp.status_code == HTTPStatus.ACCEPTED
+        job_id = create_resp.json()["job_id"]
+
+        cancel_resp = client.post(f"/api/migrations/jobs/{job_id}/cancel")
+        assert cancel_resp.status_code == HTTPStatus.OK
+        assert cancel_resp.json() == {"deleted": True, "job_id": job_id}
+
+        # Release the in-progress migration so the worker observes cancellation.
+        gate.set()
+
+        final_job = None
+        for _ in range(100):
+            poll = client.get(f"/api/migrations/jobs/{job_id}")
+            assert poll.status_code == HTTPStatus.OK
+            final_job = poll.json()
+            if final_job["status"] == "CANCELLED":
+                break
+            time.sleep(0.02)
+
+        assert final_job is not None
+        assert final_job["status"] == "CANCELLED"
+        assert final_job["completed_at"] is not None
+
+        events = client.get(f"/api/migrations/jobs/{job_id}/events").json()["events"]
+        assert any(ev["stage"] == "cancelled" for ev in events)
+
+        # Cancellation is terminal: repeating it is not found.
+        again = client.post(f"/api/migrations/jobs/{job_id}/cancel")
+        assert again.status_code == HTTPStatus.NOT_FOUND
+    finally:
+        gate.set()
+
+
+def test_cancel_unknown_job_returns_404():
+    client = TestClient(app)
+    resp = client.post("/api/migrations/jobs/mig_doesnotexist/cancel")
+    assert resp.status_code == HTTPStatus.NOT_FOUND
+
+
 def test_angular_spa_fallback_serves_deep_links_without_shadowing_api(tmp_path: Path, monkeypatch):
     dist = tmp_path / "dist"
     dist.mkdir()

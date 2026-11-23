@@ -63,9 +63,17 @@
       <div class="panel kpi">
         <span class="kpi-label">Branch & Commit</span>
         <span class="kpi-value mono kpi-branch">{{ branchName() }}</span>
-        @if (isRemoteRepo()) {
-          <a class="kpi-sub mono commit-link" [href]="commitUrl()" target="_blank" rel="noopener noreferrer">
-            {{ shortSha(s.final_commit ?? s.baseline_commit) }} ↗
+        @if (hasLocalMigrationCommit()) {
+          <span
+            class="kpi-sub mono commit-link"
+            title="Local workspace commit (not pushed to remote) — click to copy SHA"
+            (click)="copyFinalSha()"
+          >
+            {{ copiedSha() ? 'Copied!' : shortSha(s.final_commit) + ' (local)' }}
+          </span>
+        } @else if (isRemoteRepo() && baselineCommitUrl()) {
+          <a class="kpi-sub mono commit-link" [href]="baselineCommitUrl()" target="_blank" rel="noopener noreferrer">
+            {{ shortSha(s.baseline_commit) }} ↗
           </a>
         } @else {
           <span class="kpi-sub mono dim">{{ shortSha(s.final_commit ?? s.baseline_commit) }}</span>

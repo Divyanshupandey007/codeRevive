@@ -100,8 +100,11 @@ def run_migration_job(
     llm_provider: Optional[LLMProvider] = None,
     docker_runner: Optional[DockerRunner] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional["threading.Event"] = None,
 ) -> MigrationServiceResult:
     """Execute ingestion, Pass 1 OpenRewrite migration, Pass 2 sandbox verification & AI error resolution, and audit export."""
+    import threading
+
     req = request or MigrationJobRequest()
     effective_ws = (
         Path(workspace_root) if workspace_root else settings.resolved_workspace_root
@@ -130,6 +133,7 @@ def run_migration_job(
         use_openrewrite=req.use_openrewrite,
         openrewrite_mode=req.openrewrite_mode,
         progress_callback=progress_callback,
+        cancel_event=cancel_event,
     )
     summary = orchestrator.run(ingestion_report)
 

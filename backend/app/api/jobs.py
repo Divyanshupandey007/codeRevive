@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.ingestion.pipeline import UnsupportedRepositoryError
 from app.llm.base import LLMProviderError
 from app.models.orchestrator import MigrationRunSummary, WorkflowState
@@ -17,7 +18,20 @@ from app.orchestrator.service import (
 )
 from app.sandbox.docker_runner import ContainerExecutionError
 
-JobStatus = Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED"]
+
+def _sanitize_error(message: str) -> str:
+    """Redact the absolute workspace path from error text surfaced to the UI.
+
+    Underlying OS/git errors (e.g. ``[WinError 5] Access is denied: 'D:\...'``)
+    include the full local path. It is the user's own machine path, not a
+    secret, but there is no reason to expose the absolute file system layout.
+    """
+    workspace = str(settings.resolved_workspace_root)
+    if workspace and workspace in message:
+        message = message.replace(workspace, "[workspace]")
+    return message
+
+JobStatus = Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
 
 
 def _utc_now_iso() -> str:
@@ -57,6 +71,7 @@ class MigrationJobManager:
         self._lock = threading.RLock()
         self._jobs: Dict[str, MigrationJobRecord] = {}
         self._order: List[str] = []
+        self._cancel_flags: Dict[str, threading.Event] = {}
 
     def submit(
         self,
@@ -81,6 +96,7 @@ class MigrationJobManager:
         with self._lock:
             self._jobs[job_id] = record
             self._order.append(job_id)
+            self._cancel_flags[job_id] = threading.Event()
             self._evict_oldest_finished_locked()
 
         worker = threading.Thread(
@@ -102,6 +118,7 @@ class MigrationJobManager:
                 if job is None or job.status in ("COMPLETED", "FAILED"):
                     self._order.pop(idx)
                     self._jobs.pop(jid, None)
+                    self._cancel_flags.pop(jid, None)
                     evicted = True
                     break
             if not evicted:
@@ -121,9 +138,21 @@ class MigrationJobManager:
         request: MigrationJobRequest,
         runner: Callable[..., MigrationServiceResult],
     ) -> None:
+        cancel_flag = self._cancel_flags.get(job_id)
         with self._lock:
             record = self._jobs.get(job_id)
             if record is None:
+                return
+            # A cancel request can land before the worker thread runs; honor it
+            # instead of clobbering it with RUNNING below.
+            if record.status == "CANCELLED":
+                record.completed_at = _utc_now_iso()
+                record.events.append(
+                    MigrationJobEvent(
+                        stage="cancelled",
+                        message="Migration cancelled by user.",
+                    )
+                )
                 return
             record.status = "RUNNING"
             record.stage = "starting"
@@ -140,10 +169,23 @@ class MigrationJobManager:
             self._append_event(job_id, stage, event_text)
 
         try:
-            result = runner(request, progress_callback=on_progress)
+            result = runner(
+                request, progress_callback=on_progress, cancel_event=cancel_flag
+            )
             with self._lock:
                 record = self._jobs.get(job_id)
                 if record is None:
+                    return
+                # The worker may have been cancelled mid-run; keep the cancelled
+                # terminal state instead of overwriting it with FAILED/COMPLETED.
+                if record.status == "CANCELLED":
+                    record.completed_at = _utc_now_iso()
+                    record.events.append(
+                        MigrationJobEvent(
+                            stage="cancelled",
+                            message="Migration cancelled by user.",
+                        )
+                    )
                     return
                 record.summary = result.summary
                 record.summary_path = result.summary_path
@@ -160,7 +202,7 @@ class MigrationJobManager:
                 else:
                     record.status = "FAILED"
                     record.stage = "failed"
-                    record.error = (
+                    record.error = _sanitize_error(
                         "; ".join(result.summary.last_build_errors[:3])
                         or "; ".join(result.summary.integrity_violations[:3])
                         or f"Workflow ended in state {result.summary.final_state.value}"
@@ -186,12 +228,12 @@ class MigrationJobManager:
                 record.status = "FAILED"
                 record.stage = "failed"
                 record.completed_at = _utc_now_iso()
-                record.error = str(exc)
+                record.error = _sanitize_error(str(exc))
                 record.error_type = type(exc).__name__
                 record.events.append(
                     MigrationJobEvent(
                         stage="failed",
-                        message=f"{type(exc).__name__}: {exc}",
+                        message=_sanitize_error(f"{type(exc).__name__}: {exc}"),
                     )
                 )
 
@@ -220,6 +262,34 @@ class MigrationJobManager:
             sliced = ordered[offset : offset + limit]
             return [job.model_copy(deep=True) for job in sliced], total
 
+    def cancel(self, job_id: str) -> bool:
+        """Request cancellation of a queued or running job.
+
+        Cooperative: the migration worker checks the cancel flag and stops at
+        the next verification round. Terminal jobs cannot be cancelled.
+        """
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None:
+                return False
+            if record.status in ("COMPLETED", "FAILED", "CANCELLED"):
+                return False
+            flag = self._cancel_flags.get(job_id)
+            if flag is None:
+                flag = threading.Event()
+                self._cancel_flags[job_id] = flag
+            flag.set()
+            record.status = "CANCELLED"
+            record.stage = "cancelled"
+            record.completed_at = _utc_now_iso()
+            record.events.append(
+                MigrationJobEvent(
+                    stage="cancelled",
+                    message="Migration cancelled by user.",
+                )
+            )
+            return True
+
     def delete(self, job_id: str) -> bool:
         with self._lock:
             record = self._jobs.get(job_id)
@@ -231,6 +301,7 @@ class MigrationJobManager:
                 )
             self._jobs.pop(job_id, None)
             self._order = [jid for jid in self._order if jid != job_id]
+            self._cancel_flags.pop(job_id, None)
             return True
 
     def clear(self) -> None:

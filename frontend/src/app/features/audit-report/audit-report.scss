@@ -64,6 +64,10 @@
 }
 .commit-link {
   color: var(--blue);
+  cursor: pointer;
+}
+.commit-link:hover {
+  text-decoration: underline;
 }
 
 .build-errors {

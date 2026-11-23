@@ -34,9 +34,12 @@
 .wordmark:hover {
   text-decoration: none;
 }
-.wordmark-glyph {
-  color: var(--accent);
-  font-size: 17px;
+.wordmark-icon {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 8px;
+  display: block;
 }
 
 .tabs {
