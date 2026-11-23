@@ -28,14 +28,6 @@ export class PipelineMonitor {
 
   readonly job = signal<MigrationJobRecord | null>(null);
   readonly events = signal<MigrationJobEvent[]>([]);
-<<<<<<< HEAD
-  readonly paused = signal(false);
-  readonly now = signal(Date.now());
-  readonly loadError = signal<string | null>(null);
-
-  private readonly consoleRef = viewChild<ElementRef<HTMLDivElement>>('console');
-
-=======
   readonly now = signal(Date.now());
   readonly loadError = signal<string | null>(null);
   readonly cancelling = signal(false);
@@ -44,7 +36,6 @@ export class PipelineMonitor {
 
   private readonly pollIntervalMs = 3_000; // was 1_000: two endpoints per tick, so this cuts polling traffic ~3x
 
->>>>>>> 4bca8ea (feat: add job cancellation, fix stale audit report, harden workspace cleanup)
   readonly logLines = computed(() => this.events().map(eventToLogLine));
 
   /** Console lines annotated with whether a minimal loader should follow them.
@@ -195,10 +186,6 @@ export class PipelineMonitor {
     this.poll();
   }
 
-<<<<<<< HEAD
-  togglePause(): void {
-    this.paused.update((p) => !p);
-=======
   cancel(): void {
     if (!this.jobId || this.cancelling()) {
       return;
@@ -213,7 +200,6 @@ export class PipelineMonitor {
         this.cancelling.set(false);
       },
     });
->>>>>>> 4bca8ea (feat: add job cancellation, fix stale audit report, harden workspace cleanup)
   }
 
   formatDuration(seconds: number): string {
