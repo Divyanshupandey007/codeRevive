@@ -83,20 +83,13 @@ def _run_response(status="queued", conclusion=None, run_id=1001, number=7):
 def test_dispatch_workflow_returns_run_id(monkeypatch):
     client, calls = _make_client(
         [
-            _FakeResponse(204),  # dispatch -> 204, no body
             _FakeResponse(
                 200,
                 {
-                    "workflow_runs": [
-                        {
-                            "id": 4242,
-                            "run_number": 3,
-                            "status": "queued",
-                            "event": "workflow_dispatch",
-                            "inputs": {"repo_url": "https://github.com/org/repo.git"},
-                            "html_url": "https://github.com/org/repo/actions/runs/4242",
-                        }
-                    ]
+                    "workflow_run_id": 4242,
+                    "run_number": 3,
+                    "status": "queued",
+                    "html_url": "https://github.com/org/repo/actions/runs/4242",
                 },
             ),
         ]
@@ -106,11 +99,11 @@ def test_dispatch_workflow_returns_run_id(monkeypatch):
     assert result.run_id == 4242
     assert result.run_number == 3
     assert result.status == "queued"
-    # dispatch POST then list_runs GET
+    # Single POST to the dispatches endpoint; no run discovery round-trip.
+    assert len(calls) == 1
     assert calls[0][0] == "POST"
     assert "dispatches" in calls[0][1]
     assert calls[0][3]["inputs"]["repo_url"] == "https://github.com/org/repo.git"
-    assert calls[1][0] == "GET"
 
 
 def test_get_run_status_normalizes_fields():

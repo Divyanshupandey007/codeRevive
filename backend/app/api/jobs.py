@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import io
 import threading
 from time import sleep
 from typing import Callable, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
+import zipfile
 
 from pydantic import BaseModel, Field
 
@@ -80,7 +82,11 @@ class JobConflictError(RuntimeError):
 
 
 def _gha_inputs(request: MigrationJobRequest) -> Dict[str, str]:
-    """Map a MigrationJobRequest to workflow_dispatch inputs for the GHA workflow."""
+    """Map a MigrationJobRequest to workflow_dispatch inputs for the GHA workflow.
+
+    Only inputs declared in .github/workflows/coderevive-migrate.yml are sent;
+    ``clean`` is applied unconditionally by the workflow itself.
+    """
     return {
         "repo_url": request.repo_url,
         "target_spring_boot": request.target_spring_boot,
@@ -88,7 +94,6 @@ def _gha_inputs(request: MigrationJobRequest) -> Dict[str, str]:
         "branch": request.branch_name,
         "openrewrite_mode": request.openrewrite_mode,
         "retry_budget": str(request.retry_budget),
-        "clean": "true",
         "llm_provider": getattr(request, "llm_provider", settings.llm_provider),
     }
 
@@ -402,9 +407,25 @@ class MigrationJobManager:
             artifact = client.find_artifact_by_name(run_id, SUMMARY_ARTIFACT_NAME)
             if artifact is not None:
                 content = client.download_artifact(artifact.artifact_id)
-                summary = MigrationRunSummary.model_validate_json(content.decode("utf-8"))
+                # GitHub's artifact download endpoint returns a ZIP archive, not
+                # the raw JSON file. Extract migration_run_summary.json from it.
+                with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                    report_name = next(
+                        (
+                            name
+                            for name in archive.namelist()
+                            if name.endswith("migration_run_summary.json")
+                        ),
+                        None,
+                    )
+                    if report_name is None:
+                        raise ValueError(
+                            "Migration summary JSON not found in artifact."
+                        )
+                    report_json = archive.read(report_name)
+                summary = MigrationRunSummary.model_validate_json(report_json)
                 summary_path = f"gha_artifact:{run_id}:{artifact.artifact_id}"
-        except (GitHubActionsError, ValueError, OSError) as exc:
+        except (GitHubActionsError, ValueError, OSError, zipfile.BadZipFile) as exc:
             # Summary download is best-effort: the job still completed successfully
             # from GitHub's perspective; surface what we have.
             summary = None

@@ -23,7 +23,12 @@ export type BackendStatus = 'checking' | 'connected' | 'disconnected';
 @Injectable({ providedIn: 'root' })
 export class CodeReviveService {
   private readonly http = inject(HttpClient);
-  private readonly api = '/api';
+  private readonly api =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1')
+      ? '/api'
+      : 'https://YOUR-HOSTLESS-URL/api';
 
   readonly backendStatus = signal<BackendStatus>('checking');
   readonly config = signal<BackendConfig | null>(null);

@@ -32,6 +32,9 @@ on:
         required: true
         default: "gemini"
 
+permissions:
+  contents: read
+
 jobs:
   migrate:
     name: Run CodeRevive migration
@@ -75,14 +78,20 @@ jobs:
       - name: Run CodeRevive migration
         env:
           CODEREVIVE_API_HOST: 127.0.0.1
+          INPUT_REPO_URL: ${{ inputs.repo_url }}
+          INPUT_TARGET_BOOT: ${{ inputs.target_spring_boot }}
+          INPUT_TARGET_JAVA: ${{ inputs.target_java }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          INPUT_OPENREWRITE_MODE: ${{ inputs.openrewrite_mode }}
+          INPUT_RETRY_BUDGET: ${{ inputs.retry_budget }}
         run: |
           python backend/app/orchestrator/run_migration.py \
-            --repo-url "${{ inputs.repo_url }}" \
-            --target-boot "${{ inputs.target_spring_boot }}" \
-            --target-java "${{ inputs.target_java }}" \
-            --branch "${{ inputs.branch }}" \
-            --openrewrite-mode "${{ inputs.openrewrite_mode }}" \
-            --retry-budget "${{ inputs.retry_budget }}" \
+            --repo-url "$INPUT_REPO_URL" \
+            --target-boot "$INPUT_TARGET_BOOT" \
+            --target-java "$INPUT_TARGET_JAVA" \
+            --branch "$INPUT_BRANCH" \
+            --openrewrite-mode "$INPUT_OPENREWRITE_MODE" \
+            --retry-budget "$INPUT_RETRY_BUDGET" \
             --clean
 
       - name: Upload migration audit summary
@@ -96,8 +105,10 @@ jobs:
       - name: Archive migrated source
         if: always()
         shell: bash
+        env:
+          INPUT_REPO_URL: ${{ inputs.repo_url }}
         run: |
-          REPO_NAME="${{ inputs.repo_url }}"
+          REPO_NAME="$INPUT_REPO_URL"
           REPO_NAME="${REPO_NAME##*/}"
           REPO_NAME="${REPO_NAME%.git}"
           WORKSPACE_DIR="backend/workspace"

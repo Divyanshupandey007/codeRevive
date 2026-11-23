@@ -137,7 +137,7 @@ class GitHubActionsClient:
         HTTP timeout for every request.
     """
 
-    API_VERSION = "2022-11-28"
+    API_VERSION = "2026-03-10"
 
     def __init__(
         self,
@@ -216,7 +216,9 @@ class GitHubActionsClient:
     ) -> WorkflowDispatchResult:
         """Trigger a ``workflow_dispatch`` run and return the resulting run id.
 
-        The run id is used as the CodeRevive remote job id (``gha_<run_id>``).
+        With GitHub API version 2026-03-10 the dispatch response contains
+        ``workflow_run_id`` directly, so we no longer need to guess which run
+        was created by listing recent runs.
         """
         payload: Dict[str, Any] = {"ref": ref, "inputs": inputs}
         data = self._request(
@@ -224,45 +226,17 @@ class GitHubActionsClient:
             f"/actions/workflows/{self._workflow_id}/dispatches",
             json=payload,
         )
-        # A successful dispatch returns 204 with no body; the run id is not in the
-        # response. We locate the run by listing the most recent runs and picking
-        # the matching workflow_dispatch run we just created.
-        return self._discover_just_dispatched_run(inputs)
-
-    def _discover_just_dispatched_run(
-        self, inputs: Dict[str, Any]
-    ) -> WorkflowDispatchResult:
-        """Best-effort discovery of the run we just dispatched.
-
-        GitHub's dispatch endpoint returns 204/empty, so we list recent runs and
-        match the newest workflow_dispatch run whose inputs correspond to our
-        request. This is intentionally tolerant: callers re-poll status anyway.
-        """
-        runs = self.list_runs(per_page=5)
-        repo_url = inputs.get("repo_url", "")
-        for run in runs:
-            if run.get("event") != "workflow_dispatch":
-                continue
-            run_inputs = run.get("inputs") or {}
-            if str(run_inputs.get("repo_url", "")) == str(repo_url):
-                return WorkflowDispatchResult(
-                    run_id=int(run["id"]),
-                    run_number=int(run.get("run_number", 0)),
-                    status=str(run.get("status", "queued")),
-                    html_url=run.get("html_url"),
-                    raw=run,
-                )
-        if runs:
-            newest = runs[0]
-            return WorkflowDispatchResult(
-                run_id=int(newest["id"]),
-                run_number=int(newest.get("run_number", 0)),
-                status=str(newest.get("status", "queued")),
-                html_url=newest.get("html_url"),
-                raw=newest,
+        run_id = data.get("workflow_run_id")
+        if not run_id:
+            raise GitHubActionsError(
+                "Workflow was dispatched but GitHub did not return a run ID."
             )
-        raise GitHubActionsError(
-            "Workflow dispatch was accepted but no matching run was found."
+        return WorkflowDispatchResult(
+            run_id=int(run_id),
+            run_number=int(data.get("run_number", 0)),
+            status=str(data.get("status", "queued")),
+            html_url=data.get("html_url"),
+            raw=data,
         )
 
     # ------------------------------------------------------------------ #

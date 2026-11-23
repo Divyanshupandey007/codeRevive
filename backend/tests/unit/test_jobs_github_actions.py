@@ -146,24 +146,35 @@ def test_gha_submit_dispatches_and_maps_queued_to_running():
     assert final.stage == "completed"
 
 
+def _summary_zip_bytes() -> bytes:
+    """Wrap the summary JSON in a ZIP archive, as GitHub's artifact API does."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("migration_run_summary.json", _summary_json_bytes())
+    return buf.getvalue()
+
+
 def test_gha_successful_run_downloads_summary_artifact():
     fake = _FakeGHAClient()
     fake.status_sequence = [
         RunStatus(run_id=2, status="completed", conclusion="success")
     ]
-    summary_bytes = _summary_json_bytes()
+    summary_zip = _summary_zip_bytes()
     fake.artifacts = [
         RunArtifact(
             artifact_id=77,
             name="migration-run-summary",
-            size_in_bytes=len(summary_bytes),
+            size_in_bytes=len(summary_zip),
             download_url=None,
             expired=False,
             created_at="2026-01-01T00:00:00Z",
             raw={},
         )
     ]
-    fake.download_content = summary_bytes
+    fake.download_content = summary_zip
     manager = MigrationJobManager(
         execution_mode="github_actions",
         github_client=fake,
@@ -253,7 +264,7 @@ def test_gha_latest_completed_summary_returns_summary():
             raw={},
         )
     ]
-    fake.download_content = _summary_json_bytes()
+    fake.download_content = _summary_zip_bytes()
     manager = MigrationJobManager(
         execution_mode="github_actions",
         github_client=fake,
@@ -309,7 +320,8 @@ def test_gha_inputs_include_all_required_fields():
     assert inputs["branch"] == "migration/spring-boot-3"
     assert inputs["openrewrite_mode"] == "hybrid"
     assert inputs["retry_budget"] == "5"
-    assert inputs["clean"] == "true"
+    # "clean" is applied unconditionally by the workflow itself, not sent as input.
+    assert "clean" not in inputs
 
 
 def test_execution_mode_defaults_to_local():

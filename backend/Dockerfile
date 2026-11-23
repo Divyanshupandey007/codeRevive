@@ -46,4 +46,5 @@ COPY backend/ ./backend
 EXPOSE 8000
 
 # Run the API on all interfaces so it is reachable from the container host.
-CMD ["python", "backend/app/main.py", "--host", "0.0.0.0", "--port", "8000"]
+# Hostless supplies a PORT environment variable; fall back to 8000 locally.
+CMD ["sh", "-c", "exec python backend/app/main.py --host 0.0.0.0 --port ${PORT:-8000}"]
