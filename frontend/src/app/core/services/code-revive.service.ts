@@ -28,7 +28,7 @@ export class CodeReviveService {
     (window.location.hostname === 'localhost' ||
       window.location.hostname === '127.0.0.1')
       ? '/api'
-      : 'https://YOUR-HOSTLESS-URL/api';
+      : 'https://coderevive.hostless.app/api';
 
   readonly backendStatus = signal<BackendStatus>('checking');
   readonly config = signal<BackendConfig | null>(null);
