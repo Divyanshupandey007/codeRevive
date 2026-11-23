@@ -1,7 +1,9 @@
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.config import BACKEND_DIR, settings
 from app.ingestion.pipeline import IngestionPipeline
@@ -23,6 +25,37 @@ class MigrationJobRequest(BaseModel):
     openrewrite_mode: str = Field(default_factory=lambda: settings.openrewrite_mode)
     retry_budget: int = Field(default_factory=lambda: settings.default_retry_budget)
     clean: bool = False
+
+    @field_validator("repo_url")
+    @classmethod
+    def _validate_repo_url(cls, v: str) -> str:
+        """Guard against SSRF and git argument injection via repo_url.
+
+        - Only https:// is allowed (blocks file://, git://, ssh://, http://).
+        - The URL must not start with '-' (git clone treats leading '-' as a flag).
+        - localhost, loopback, link-local, private/RFC1918 IPs and .local hosts
+          are rejected to prevent scanning the deploy host's own network.
+        """
+        if not v or not v.strip():
+            raise ValueError("repo_url is required")
+        v = v.strip()
+        if v.startswith("-"):
+            raise ValueError("repo_url must not start with '-'")
+        parsed = urlparse(v)
+        if parsed.scheme != "https":
+            raise ValueError("repo_url must use https://")
+        host = parsed.hostname or ""
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or host.endswith(".local"):
+            raise ValueError("repo_url must not point to localhost or .local")
+        try:
+            ip = ip_address(host)
+        except ValueError:
+            ip = None  # a hostname, not an IP — that's fine
+        if ip is not None and (
+            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+        ):
+            raise ValueError("repo_url must not point to a private/internal address")
+        return v
 
 
 class MigrationServiceResult(BaseModel):

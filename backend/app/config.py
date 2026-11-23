@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     target_spring_boot_version: str = "3.2.5"
     target_java_version: str = "17"
 
+    # Optional API key. When set, state-changing endpoints (POST /api/migrations,
+    # POST /api/migrations/jobs, POST /cancel, DELETE /api/migrations/jobs/{id})
+    # require an X-API-Key header matching this value. Left empty for local dev.
+    api_key: str = ""
+
     # Hybrid OpenRewrite configuration
     use_openrewrite: bool = True
     openrewrite_mode: str = "hybrid"  # "hybrid" | "deterministic" | "maven_only"

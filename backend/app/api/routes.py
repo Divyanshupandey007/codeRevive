@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import (
     APIRouter,
     Body,
+    Depends,
     Header,
     HTTPException,
     Query,
@@ -20,6 +21,7 @@ from app.api.jobs import (
     MigrationJobRecord,
     job_manager,
 )
+from app.config import settings
 from app.orchestrator.service import (
     MigrationJobRequest,
     get_active_config,
@@ -75,6 +77,23 @@ class MigrationJobEventsResponse(BaseModel):
 class DeleteJobResponse(BaseModel):
     deleted: bool
     job_id: str
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
+    """Require an X-API-Key header matching settings.api_key when an API key is configured.
+
+    When CODEREVIVE_API_KEY is not set (local development), this dependency is a no-op.
+    Applied only to state-changing endpoints: POST /api/migrations, POST /api/migrations/jobs,
+    POST /cancel, DELETE /api/migrations/jobs/{id}.
+    """
+    if not settings.api_key:
+        return
+    if x_api_key is None or x_api_key != settings.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-API-Key header.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
 
 
 def health_check() -> Dict[str, str]:
@@ -290,6 +309,7 @@ def build_api_router() -> APIRouter:
         async_flag: Optional[bool] = Query(default=None, alias="async"),
         mode: Optional[str] = Query(default=None),
         prefer: Optional[str] = Header(default=None, alias="Prefer"),
+        _auth: None = Depends(require_api_key),
     ) -> Dict[str, Any]:
         payload = request_body.model_dump() if request_body is not None else {}
         if _wants_async_execution(async_flag, mode, prefer):
@@ -349,6 +369,7 @@ def build_api_router() -> APIRouter:
     def create_job_route(
         response: Response,
         request_body: Optional[MigrationJobRequest] = Body(default=None),
+        _auth: None = Depends(require_api_key),
     ) -> Dict[str, Any]:
         payload = request_body.model_dump() if request_body is not None else {}
         job = start_migration_job_endpoint(payload)
@@ -391,7 +412,7 @@ def build_api_router() -> APIRouter:
         tags=["Migration Jobs"],
         summary="Delete a completed or failed migration job record",
     )
-    def delete_job_route(job_id: str) -> Dict[str, Any]:
+    def delete_job_route(job_id: str, _auth: None = Depends(require_api_key)) -> Dict[str, Any]:
         try:
             deleted = delete_migration_job_endpoint(job_id)
         except JobConflictError as exc:
@@ -412,7 +433,7 @@ def build_api_router() -> APIRouter:
         tags=["Migration Jobs"],
         summary="Request cancellation of a queued or running migration job",
     )
-    def cancel_job_route(job_id: str) -> Dict[str, Any]:
+    def cancel_job_route(job_id: str, _auth: None = Depends(require_api_key)) -> Dict[str, Any]:
         cancelled = cancel_migration_job_endpoint(job_id)
         if not cancelled:
             raise HTTPException(
