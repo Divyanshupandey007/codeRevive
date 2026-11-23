@@ -3,7 +3,7 @@
     <div class="panel form-panel">
       <div class="panel-head">
         <h1>New Migration</h1>
-        <span class="dim">Spring Boot 2.x → 3.2.5 · Java 17</span>
+        <span class="dim">Spring Boot 2.x → {{ targetBoot() }} · Java {{ targetJava() }}</span>
       </div>
 
       <div class="field">
@@ -42,11 +42,11 @@
         <dl class="profile-indicators">
           <div class="profile-indicator">
             <dt>Target Spring Boot</dt>
-            <dd class="mono">{{ profile.targetBoot }}</dd>
+            <dd class="mono">{{ targetBoot() }}</dd>
           </div>
           <div class="profile-indicator">
             <dt>Target Java</dt>
-            <dd class="mono">{{ profile.targetJava }}</dd>
+            <dd class="mono">{{ targetJava() }}</dd>
           </div>
         </dl>
         <p class="profile-note dim">Locked to the validated migration configuration</p>

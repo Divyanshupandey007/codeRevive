@@ -11,13 +11,6 @@ const REMOTE_PRESETS: RepositoryPreset[] = [
   { label: 'mybatis-spring-boot-jpetstore', url: 'https://github.com/kazuki43zoo/mybatis-spring-boot-jpetstore.git' },
 ];
 
-const PRODUCTION_PROFILE = {
-  targetBoot: '3.2.5',
-  targetJava: '17',
-  strategy: 'hybrid',
-  useOpenrewrite: true
-} as const;
-
 @Component({
   selector: 'app-launcher',
   imports: [FormsModule, RouterLink, DatePipe],
@@ -30,12 +23,17 @@ export class Launcher {
   private readonly destroyRef = inject(DestroyRef);
 
   readonly presets = computed(() => this.api.config()?.repository_presets ?? REMOTE_PRESETS);
-  readonly profile = PRODUCTION_PROFILE;
 
-  // Form state (bound to MigrationJobRequest)
+  // Form state (bound to MigrationJobRequest) — defaults come from backend config
   readonly repoUrl = signal('');
-  readonly branchName = signal('migration/spring-boot-3');
+  readonly branchName = signal('');
   readonly retryBudget = signal(5);
+
+  // Dynamic profile values sourced from GET /api/config (CODEREVIVE_* env vars)
+  readonly targetBoot = signal<string>('3.2.5');
+  readonly targetJava = signal<string>('17');
+  readonly useOpenrewrite = signal(true);
+  readonly openrewriteMode = signal<'hybrid' | 'deterministic' | 'maven_only'>('hybrid');
 
   readonly submitting = signal(false);
   readonly error = signal<string | null>(null);
@@ -71,6 +69,10 @@ export class Launcher {
         this.repoUrl.set(c.repo_url);
         this.branchName.set(c.migration_branch_name);
         this.retryBudget.set(c.default_retry_budget);
+        this.targetBoot.set(c.target_spring_boot_version);
+        this.targetJava.set(c.target_java_version);
+        this.useOpenrewrite.set(c.use_openrewrite);
+        this.openrewriteMode.set(c.openrewrite_mode as 'hybrid' | 'deterministic' | 'maven_only');
       }
     });
     this.api.loadConfig();
@@ -151,11 +153,11 @@ export class Launcher {
     }
     const request: MigrationJobRequest = {
       repo_url: repo,
-      target_spring_boot: this.profile.targetBoot,
-      target_java: this.profile.targetJava,
+      target_spring_boot: this.targetBoot(),
+      target_java: this.targetJava(),
       branch_name: this.branchName().trim() || 'migration/spring-boot-3',
-      use_openrewrite: this.profile.useOpenrewrite,
-      openrewrite_mode: this.profile.strategy,
+      use_openrewrite: this.useOpenrewrite(),
+      openrewrite_mode: this.openrewriteMode(),
       retry_budget: Math.max(0, Math.floor(this.retryBudget() || 0)),
       clean: true
     };

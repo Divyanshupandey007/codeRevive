@@ -84,25 +84,25 @@ describe('Launcher', () => {
     const profile = root.querySelector('.profile-indicators');
 
     expect(root.querySelector('select')).toBeNull();
-    expect(profile?.textContent).toContain('3.2.5');
-    expect(profile?.textContent).toContain('17');
+    expect(profile?.textContent).toContain('3.5.0');
+    expect(profile?.textContent).toContain('21');
     expect(profile?.textContent).not.toContain('Migration Strategy');
     expect(profile?.textContent).not.toContain('Hybrid');
-    expect(profile?.textContent).not.toContain('3.5.0');
-    expect(profile?.textContent).not.toContain('21');
+    expect(profile?.textContent).not.toContain('3.2.5');
+    expect(profile?.textContent).not.toContain('17');
     expect(profile?.textContent).not.toContain('Maven-only');
   });
 
-  it('always submits the locked profile despite conflicting backend defaults', () => {
+  it('always submits values from backend config, not hardcoded defaults', () => {
     vi.spyOn(TestBed.inject(Router), 'navigate').mockResolvedValue(true);
     component.repoUrl.set('https://github.com/org/demo.git');
     component.submit();
 
     const request = http.expectOne('/api/migrations/jobs');
-    expect(request.request.body.target_spring_boot).toBe('3.2.5');
-    expect(request.request.body.target_java).toBe('17');
-    expect(request.request.body.use_openrewrite).toBe(true);
-    expect(request.request.body.openrewrite_mode).toBe('hybrid');
+    expect(request.request.body.target_spring_boot).toBe('3.5.0');
+    expect(request.request.body.target_java).toBe('21');
+    expect(request.request.body.use_openrewrite).toBe(false);
+    expect(request.request.body.openrewrite_mode).toBe('maven_only');
     request.flush(makeJob({ status: 'QUEUED', stage: 'queued', completed_at: null }));
     http.expectOne('/api/migrations/jobs?limit=50&offset=0').flush({ items: [], total: 0, limit: 50, offset: 0 });
   });
