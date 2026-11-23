@@ -51,6 +51,7 @@ jobs:
       CODEREVIVE_OPENREWRITE_MODE: ${{ inputs.openrewrite_mode }}
       CODEREVIVE_DEFAULT_RETRY_BUDGET: ${{ inputs.retry_budget }}
       CODEREVIVE_LLM_PROVIDER: ${{ inputs.llm_provider }}
+      CODEREVIVE_GEMINI_MODEL: ${{ vars.CODEREVIVE_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
       # LLM API keys are provided by GitHub Secrets and never reach the frontend.
       CODEREVIVE_GEMINI_API_KEY: ${{ secrets.CODEREVIVE_GEMINI_API_KEY }}
       CODEREVIVE_NVIDIA_API_KEY: ${{ secrets.CODEREVIVE_NVIDIA_API_KEY }}
