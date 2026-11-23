@@ -1,0 +1,122 @@
+name: CodeRevive Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "Git repository URL to migrate (https:// only)"
+        required: true
+        default: "https://github.com/kazuki43zoo/mybatis-spring-boot-jpetstore.git"
+      target_spring_boot:
+        description: "Target Spring Boot 3.x version"
+        required: true
+        default: "3.2.5"
+      target_java:
+        description: "Target Java version"
+        required: true
+        default: "17"
+      branch:
+        description: "Migration branch name"
+        required: true
+        default: "migration/spring-boot-3"
+      openrewrite_mode:
+        description: "OpenRewrite mode: hybrid, deterministic, or maven_only"
+        required: true
+        default: "hybrid"
+      retry_budget:
+        description: "Maximum sandbox repair rounds"
+        required: true
+        default: "5"
+      llm_provider:
+        description: "LLM provider: gemini, nvidia, or openrouter"
+        required: true
+        default: "gemini"
+
+jobs:
+  migrate:
+    name: Run CodeRevive migration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Force github_actions mode so Docker is never launched locally here;
+      # the sandbox runs inside this runner via the migration CLI.
+      CODEREVIVE_EXECUTION_MODE: github_actions
+      CODEREVIVE_REPO_URL: ${{ inputs.repo_url }}
+      CODEREVIVE_TARGET_SPRING_BOOT_VERSION: ${{ inputs.target_spring_boot }}
+      CODEREVIVE_TARGET_JAVA_VERSION: ${{ inputs.target_java }}
+      CODEREVIVE_MIGRATION_BRANCH_NAME: ${{ inputs.branch }}
+      CODEREVIVE_OPENREWRITE_MODE: ${{ inputs.openrewrite_mode }}
+      CODEREVIVE_DEFAULT_RETRY_BUDGET: ${{ inputs.retry_budget }}
+      CODEREVIVE_LLM_PROVIDER: ${{ inputs.llm_provider }}
+      # LLM API keys are provided by GitHub Secrets and never reach the frontend.
+      CODEREVIVE_GEMINI_API_KEY: ${{ secrets.CODEREVIVE_GEMINI_API_KEY }}
+      CODEREVIVE_NVIDIA_API_KEY: ${{ secrets.CODEREVIVE_NVIDIA_API_KEY }}
+      CODEREVIVE_OPENROUTER_API_KEY: ${{ secrets.CODEREVIVE_OPENROUTER_API_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Build sandbox Docker image
+        run: |
+          docker build -f backend/Dockerfile.sandbox -t coderevive-maven-chrome:17 backend
+
+      - name: Run CodeRevive migration
+        env:
+          CODEREVIVE_API_HOST: 127.0.0.1
+        run: |
+          python backend/app/orchestrator/run_migration.py \
+            --repo-url "${{ inputs.repo_url }}" \
+            --target-boot "${{ inputs.target_spring_boot }}" \
+            --target-java "${{ inputs.target_java }}" \
+            --branch "${{ inputs.branch }}" \
+            --openrewrite-mode "${{ inputs.openrewrite_mode }}" \
+            --retry-budget "${{ inputs.retry_budget }}" \
+            --clean
+
+      - name: Upload migration audit summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-run-summary
+          path: backend/workspace/migration_run_summary.json
+          retention-days: 1
+
+      - name: Archive migrated source
+        if: always()
+        shell: bash
+        run: |
+          REPO_NAME="${{ inputs.repo_url }}"
+          REPO_NAME="${REPO_NAME##*/}"
+          REPO_NAME="${REPO_NAME%.git}"
+          WORKSPACE_DIR="backend/workspace"
+          ZIP_PATH="migrated-source.zip"
+          if [ -d "$WORKSPACE_DIR/$REPO_NAME" ]; then
+            zip -r "$ZIP_PATH" "$WORKSPACE_DIR/$REPO_NAME"
+          elif [ -d "$WORKSPACE_DIR" ]; then
+            zip -r "$ZIP_PATH" "$WORKSPACE_DIR" || true
+          else
+            echo "No workspace directory found to archive."
+            exit 0
+          fi
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
+          echo "REPO_NAME=$REPO_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload migrated-source archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migrated-source
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 1

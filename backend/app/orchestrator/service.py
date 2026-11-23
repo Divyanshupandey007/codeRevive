@@ -13,7 +13,6 @@ from app.models.orchestrator import MigrationRunSummary
 from app.orchestrator.workflow import MigrationOrchestrator
 from app.sandbox.docker_runner import DockerRunner
 
-
 class MigrationJobRequest(BaseModel):
     """Single canonical request payload shared by CLI, Python callers, and future UI/API."""
 
@@ -137,6 +136,16 @@ def run_migration_job(
 ) -> MigrationServiceResult:
     """Execute ingestion, Pass 1 OpenRewrite migration, Pass 2 sandbox verification & AI error resolution, and audit export."""
     import threading
+
+    # Defense in depth: when running in production github_actions mode on Hostless,
+    # the backend must never launch Docker locally. Migrations run exclusively on
+    # GitHub Actions runners (see backend/app/api/jobs.py). The GHA workflow
+    # invokes the run_migration CLI directly, bypassing this service function.
+    if settings.execution_mode == "github_actions":
+        raise RuntimeError(
+            "Local Docker execution is disabled in github_actions execution mode. "
+            "Run migrations via the GitHub Actions workflow instead."
+        )
 
     req = request or MigrationJobRequest()
     effective_ws = (

@@ -105,6 +105,54 @@ For programmatic or frontend integration, run the FastAPI backend server (`pytho
 
 ---
 
+## Deployment Architecture
+
+CodeRevive is designed to run in production as three tiers:
+
+1. **Frontend** — an Angular 21 app served on [Cloudflare Pages](https://pages.cloudflare.com). It talks only to the backend's own authenticated REST API and never receives GitHub tokens or LLM API keys.
+2. **Backend** — the FastAPI server running on **Hostless** (`CODEREVIVE_API_HOST=0.0.0.0` inside a container, port `8000`). It exposes `GET /api/config`, `GET /api/migrations/latest`, `POST /api/migrations`, and background job tracking at `/api/migrations/jobs` (OpenAPI docs at `/docs`).
+3. **Migration execution** — GitHub Actions `ubuntu-24.04` runners via the `.github/workflows/coderevive-migrate.yml` workflow, triggered with `workflow_dispatch`.
+
+### Execution modes
+
+The backend supports two execution modes, selected by `CODEREVIVE_EXECUTION_MODE` in `backend/.env` (see `.env.example` for the full list):
+
+- **`local` (default)** — migrations run on the Hostless backend inside the hardened Docker sandbox (`coderevive-maven-chrome:17`), preserving the original behavior. Use this for local development.
+- **`github_actions`** (production on Hostless) — the backend never launches Docker locally. Instead, `POST /api/migrations/jobs` dispatches a `workflow_dispatch` run to GitHub Actions; the `workflow_run_id` becomes the remote job id (`gha_<run_id>`), and a background thread polls the run, mapping GitHub states to CodeRevive job statuses (`QUEUED`/`RUNNING`/`COMPLETED`/`FAILED`/`CANCELLED`). In this mode synchronous `POST /api/migrations` returns `400`, and `GET /api/migrations/latest` retrieves the summary from the completed workflow's `migration-run-summary` artifact.
+
+Concurrent GitHub Actions jobs are capped by `CODEREVIVE_MAX_CONCURRENT_GITHUB_ACTIONS_JOBS` (default `1`) to prevent runner exhaustion on Hostless.
+
+### GitHub Secrets (never reach the frontend)
+
+LLM provider API keys are provided to the runner via GitHub Secrets and are never exposed to the Angular frontend:
+
+| Secret | Purpose |
+|--------|---------|
+| `CODEREVIVE_GEMINI_API_KEY` | Google Gemini API key |
+| `CODEREVIVE_NVIDIA_API_KEY` | NVIDIA NIM API key |
+| `CODEREVIVE_OPENROUTER_API_KEY` | OpenRouter API key |
+| `CODEREVIVE_GITHUB_TOKEN` | PAT / App installation token with `actions:write` for the migration repo |
+
+The backend holds the `CODEREVIVE_GITHUB_TOKEN` in memory and uses it to call the GitHub Actions REST API (dispatch, poll, cancel, artifacts). The frontend only sees job status summaries.
+
+### GitHub Actions workflow
+
+`.github/workflows/coderevive-migrate.yml` defines a `workflow_dispatch` with inputs for `repo_url`, `target_spring_boot`, `target_java`, `branch`, `openrewrite_mode`, `retry_budget`, and `llm_provider`. Each run:
+
+1. Checks out the target repository with `fetch-depth: 0`.
+2. Sets up Python 3.12 and installs `backend/requirements.txt` (pinned).
+3. Builds the sandbox image from `backend/Dockerfile.sandbox`.
+4. Runs `backend/app/orchestrator/run_migration.py` CLI with the dispatch inputs; LLM keys come from `${{ secrets.* }}`.
+5. Uploads `migration-run-summary` (`migration_run_summary.json`) and `migrated-source` (zipped workspace) as artifacts with `retention-days: 1`.
+
+The backend retrieves the completed summary via `GET /api/migrations/jobs/{job_id}/artifacts` and the download endpoint `GET /api/migrations/jobs/{job_id}/artifacts/{artifact_id}/download`.
+
+### Environment variables
+
+All new variables use the `CODEREVIVE_` prefix and are documented in `backend/.env.example`. Copy `.env.example` to `.env`, fill in your keys, and set `CODEREVIVE_EXECUTION_MODE=github_actions` for production Hostless deployments.
+
+---
+
 ## Automated Tests & Evaluation Benchmark
 
 Run the full `pytest` unit and integration suite (covering AST parsing, POM planning, Jakarta allowlist, OpenRewrite runner, guardrails, diagnostics classification, sandbox DB fallback, and orchestrator failure/rollback states):

@@ -94,6 +94,20 @@ class Settings(BaseSettings):
         ]
     )
 
+    # GitHub Actions execution mode (production on Hostless).
+    # When CODEREVIVE_EXECUTION_MODE == "github_actions", the backend does NOT run
+    # Docker locally. Migrations are dispatched to GitHub Actions ubuntu-24.04
+    # runners via workflow_dispatch and tracked by run id.
+    execution_mode: str = "local"  # "local" | "github_actions"
+    github_token: str = ""
+    github_owner: str = ""
+    github_repo: str = ""
+    github_workflow_id: str = "coderevive-migrate.yml"
+    github_api_base_url: str = "https://api.github.com"
+    max_concurrent_github_actions_jobs: int = 1
+    github_actions_poll_interval_seconds: int = 15
+    github_actions_job_timeout_seconds: int = 3600
+
     # HTTP API / Routing / Angular CORS & SPA settings
     api_host: str = "127.0.0.1"
     api_port: int = 8000

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import (
@@ -22,12 +23,47 @@ from app.api.jobs import (
     job_manager,
 )
 from app.config import settings
+from app.integrations.github_actions_client import (
+    GitHubActionsClient,
+    GitHubActionsError,
+    GitHubActionsNotFound,
+)
 from app.orchestrator.service import (
     MigrationJobRequest,
     get_active_config,
     load_latest_summary,
     run_migration_job,
 )
+
+
+def _extract_gha_run_id(job_id: str) -> Optional[int]:
+    """Extract the GitHub Actions run id from a ``gha_<run_id>`` job id."""
+    prefix = "gha_"
+    if not job_id.startswith(prefix):
+        return None
+    try:
+        return int(job_id[len(prefix):])
+    except ValueError:
+        return None
+
+
+_github_client_instance: Optional[GitHubActionsClient] = None
+_github_client_lock = threading.Lock()
+
+
+def _get_github_client() -> GitHubActionsClient:
+    """Lazily build a shared GitHubActionsClient from backend settings."""
+    global _github_client_instance
+    with _github_client_lock:
+        if _github_client_instance is None:
+            _github_client_instance = GitHubActionsClient(
+                token=settings.github_token,
+                owner=settings.github_owner,
+                repo=settings.github_repo,
+                workflow_id=settings.github_workflow_id,
+                base_url=settings.github_api_base_url,
+            )
+        return _github_client_instance
 
 
 class HealthResponse(BaseModel):
@@ -317,6 +353,18 @@ def build_api_router() -> APIRouter:
             response.status_code = status.HTTP_202_ACCEPTED
             response.headers["Location"] = f"/api/migrations/jobs/{job['job_id']}"
             return job
+        # Synchronous execution runs the migration (and Docker sandbox) on the
+        # Hostless backend. In production github_actions mode that is disabled:
+        # migrations run exclusively on GitHub Actions runners.
+        if settings.execution_mode == "github_actions":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Synchronous migration is disabled in github_actions mode. "
+                    "Use POST /api/migrations/jobs (?async=true) to dispatch the "
+                    "migration to GitHub Actions instead."
+                ),
+            )
         return start_migration_endpoint(payload)
 
     @router.get(
@@ -325,6 +373,18 @@ def build_api_router() -> APIRouter:
         summary="Get latest completed migration summary (404 if no migration ran in this backend session)",
     )
     def latest_migration_route() -> Dict[str, Any]:
+        # In github_actions mode the backend on Hostless does not run Docker and
+        # has no local workspace summary file. The report lives in the completed
+        # workflow's artifact, so retrieve it from the latest completed GHA job.
+        if settings.execution_mode == "github_actions":
+            summary = job_manager.get_latest_completed_summary()
+            if summary is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No migration report found yet.",
+                )
+            return summary.model_dump()
+
         # The summary file survives backend restarts, but it must only be served
         # when it is backed by an actual job run in this session — otherwise a
         # stale report from before the restart would leak through.
@@ -441,6 +501,76 @@ def build_api_router() -> APIRouter:
                 detail=f"Migration job '{job_id}' not found or cannot be cancelled.",
             )
         return {"deleted": True, "job_id": job_id}
+
+    @router.get(
+        "/api/migrations/jobs/{job_id}/artifacts",
+        tags=["Artifacts"],
+        summary="List workflow-run artifacts for a GitHub Actions migration job",
+    )
+    def list_job_artifacts_route(job_id: str) -> Dict[str, Any]:
+        run_id = _extract_gha_run_id(job_id)
+        if run_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Job '{job_id}' is not a GitHub Actions migration job.",
+            )
+        client = _get_github_client()
+        artifacts = client.list_artifacts(run_id)
+        return {
+            "job_id": job_id,
+            "run_id": run_id,
+            "artifacts": [
+                {
+                    "artifact_id": a.artifact_id,
+                    "name": a.name,
+                    "size_in_bytes": a.size_in_bytes,
+                    "expired": a.expired,
+                    "created_at": a.created_at,
+                }
+                for a in artifacts
+            ],
+        }
+
+    @router.get(
+        "/api/migrations/jobs/{job_id}/artifacts/{artifact_id}/download",
+        tags=["Artifacts"],
+        summary="Download a workflow-run artifact for a GitHub Actions migration job",
+    )
+    def download_job_artifact_route(job_id: str, artifact_id: int) -> Response:
+        run_id = _extract_gha_run_id(job_id)
+        if run_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Job '{job_id}' is not a GitHub Actions migration job.",
+            )
+        client = _get_github_client()
+        try:
+            content = client.download_artifact(artifact_id)
+        except GitHubActionsNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Artifact {artifact_id} not found for run {run_id}.",
+            )
+        # Determine a sensible filename from the artifact name.
+        artifact = client.find_artifact_by_name(run_id, "")  # placeholder, replaced below
+        _ = artifact
+        # Look up the artifact name to set the download filename.
+        filename = f"artifact-{artifact_id}.zip"
+        try:
+            for a in client.list_artifacts(run_id):
+                if a.artifact_id == artifact_id:
+                    filename = a.name or filename
+                    break
+        except GitHubActionsError:
+            pass
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Request-ID": "",
+            },
+        )
 
     @router.get(
         "/api/migrations/{job_id}",
