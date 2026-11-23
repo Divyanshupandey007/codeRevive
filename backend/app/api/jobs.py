@@ -717,8 +717,22 @@ class MigrationJobManager:
             if artifact is None:
                 return None
             content = client.download_artifact(artifact.artifact_id)
-            return MigrationRunSummary.model_validate_json(content.decode("utf-8"))
-        except (GitHubActionsError, ValueError, OSError):
+            # GitHub's artifact download endpoint returns a ZIP archive, not the
+            # raw JSON file. Extract migration_run_summary.json from it.
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                report_name = next(
+                    (
+                        name
+                        for name in archive.namelist()
+                        if name.endswith("migration_run_summary.json")
+                    ),
+                    None,
+                )
+                if report_name is None:
+                    return None
+                report_json = archive.read(report_name)
+            return MigrationRunSummary.model_validate_json(report_json)
+        except (GitHubActionsError, ValueError, OSError, zipfile.BadZipFile):
             return None
 
 
