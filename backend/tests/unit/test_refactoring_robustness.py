@@ -188,6 +188,7 @@ def test_docker_executors_enforce_cap_drop_all(tmp_path: Path, monkeypatch):
     cli_exec = _DockerCLIExecutor("coderevive-maven-chrome:17")
     cli_exec.execute(tmp_path, ["test"], 30, "2g", 1.0, True, "vol", "/app")
     assert "--cap-drop=ALL" in captured_cli_cmd
+    assert "--cap-add=DAC_OVERRIDE" in captured_cli_cmd
     assert "--security-opt=no-new-privileges:true" in captured_cli_cmd
 
     captured_sdk_kwargs = {}
@@ -208,6 +209,7 @@ def test_docker_executors_enforce_cap_drop_all(tmp_path: Path, monkeypatch):
     sdk_exec = _DockerSDKExecutor("coderevive-maven-chrome:17")
     sdk_exec.execute(tmp_path, ["test"], 30, "2g", 1.0, True, "vol", "/app")
     assert captured_sdk_kwargs["cap_drop"] == ["ALL"]
+    assert captured_sdk_kwargs["cap_add"] == ["DAC_OVERRIDE"]
     assert captured_sdk_kwargs["security_opt"] == ["no-new-privileges:true"]
 
 
