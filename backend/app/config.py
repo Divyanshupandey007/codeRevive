@@ -108,6 +108,15 @@ class Settings(BaseSettings):
     github_actions_poll_interval_seconds: int = 15
     github_actions_job_timeout_seconds: int = 3600
 
+    # Progress event relay: lets a GitHub Actions-dispatched migration POST its
+    # real internal stage transitions (OPENREWRITE_PASS, VERIFYING_SANDBOX, ...)
+    # back to this backend as they happen, instead of the backend only seeing
+    # coarse run/step status via polling (see run_migration.py and
+    # MigrationJobManager.append_remote_event). Left empty disables the relay;
+    # the poll loop then falls back to its best-effort step-name heuristic.
+    progress_callback_url: str = ""
+    progress_callback_token: str = ""
+
     # HTTP API / Routing / Angular CORS & SPA settings
     api_host: str = "127.0.0.1"
     api_port: int = 8000

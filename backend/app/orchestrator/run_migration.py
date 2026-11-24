@@ -1,10 +1,14 @@
 import argparse
+import os
 from pathlib import Path
 import sys
+from typing import Callable, Optional
 
 backend_root = Path(__file__).resolve().parents[2]
 if str(backend_root) not in sys.path:
     sys.path.insert(0, str(backend_root))
+
+import httpx
 
 from app.config import settings
 from app.ingestion.pipeline import IngestionPipeline, UnsupportedRepositoryError
@@ -13,6 +17,51 @@ from app.models.orchestrator import FileStatus, WorkflowState
 from app.orchestrator.service import MigrationJobRequest
 from app.orchestrator.workflow import MigrationOrchestrator
 from app.sandbox.docker_runner import ContainerExecutionError
+
+
+def _build_progress_publisher() -> Optional[Callable[[str], None]]:
+    """Build a progress_callback that relays each internal stage transition
+    back to the backend's live Pipeline Monitor.
+
+    When this CLI runs inside the GitHub Actions workflow, the backend has no
+    way to see *inside* the single "Run CodeRevive migration" step other than
+    this relay (GitHub only exposes whole-step status, and only returns a
+    step's logs once it has finished). Each transition is POSTed to
+    POST /api/internal/github-actions/runs/{run_id}/events, which
+    MigrationJobManager.append_remote_event appends to the same job record
+    the Angular Pipeline Monitor already polls.
+
+    Returns None (callback disabled) unless CODEREVIVE_PROGRESS_CALLBACK_URL,
+    CODEREVIVE_PROGRESS_CALLBACK_TOKEN and GITHUB_RUN_ID (set automatically by
+    Actions) are all present, so this is a no-op for local runs.
+    """
+    base_url = settings.progress_callback_url
+    token = settings.progress_callback_token
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not (base_url and token and run_id):
+        return None
+
+    endpoint = f"{base_url.rstrip('/')}/{run_id}/events"
+
+    def publish(event_text: str) -> None:
+        # Print locally first: the GitHub Actions console log must keep
+        # working even if the relay call below fails or times out.
+        print(event_text, flush=True)
+        stage = event_text.split(":", 1)[0] if ":" in event_text else event_text
+        try:
+            httpx.post(
+                endpoint,
+                json={"stage": stage, "message": event_text},
+                headers={"X-CodeRevive-Progress-Token": token},
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            # Best-effort: a dropped progress update must never fail the
+            # migration itself. The backend's own poll loop still provides a
+            # coarse fallback if every relay call fails.
+            print(f"[PROGRESS_RELAY_WARNING] {exc}", flush=True)
+
+    return publish
 
 _STATUS_MARKER = {
     FileStatus.SUCCESS: "[PASS]",
@@ -95,7 +144,11 @@ def main() -> int:
 
     print("========== CODEREVIVE: AUTONOMOUS MIGRATION ENGINE ==========")
 
+    publish_progress = _build_progress_publisher()
+
     print(f"\n[1/3] Ingesting {request.repo_url} ...")
+    if publish_progress:
+        publish_progress(f"ingesting:{request.repo_url}")
     try:
         ingestion_report = IngestionPipeline(
             branch_name=request.branch_name,
@@ -119,6 +172,9 @@ def main() -> int:
     print(f"  migration targets:  {len(ingestion_report.files_to_migrate)}")
     print(f"  baseline @Test:     {ingestion_report.baseline_test_count}")
 
+    if publish_progress:
+        publish_progress(f"orchestrating:{repo_path}")
+
     print(
         "\n[2/3] Running hybrid OpenRewrite + LLM migration loop with sandbox verification ..."
     )
@@ -128,6 +184,7 @@ def main() -> int:
             retry_budget=request.retry_budget,
             use_openrewrite=request.use_openrewrite,
             openrewrite_mode=request.openrewrite_mode,
+            progress_callback=publish_progress,
         )
         summary = orchestrator.run(ingestion_report)
     except (ValueError, ImportError) as exc:

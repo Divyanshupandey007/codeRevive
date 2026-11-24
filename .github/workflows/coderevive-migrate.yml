@@ -79,6 +79,14 @@ jobs:
       - name: Run CodeRevive migration
         env:
           CODEREVIVE_API_HOST: 127.0.0.1
+          # Lets this run relay its real OPENREWRITE_PASS / VERIFYING_SANDBOX /
+          # REPAIRING / ... transitions back to the live Pipeline Monitor as
+          # they happen (see run_migration.py and POST /api/internal/
+          # github-actions/runs/{run_id}/events). GITHUB_RUN_ID is already set
+          # automatically by Actions. Leave CODEREVIVE_PROGRESS_CALLBACK_URL
+          # unset to disable the relay and fall back to coarse step polling.
+          CODEREVIVE_PROGRESS_CALLBACK_URL: ${{ vars.CODEREVIVE_PROGRESS_CALLBACK_URL }}
+          CODEREVIVE_PROGRESS_CALLBACK_TOKEN: ${{ secrets.CODEREVIVE_PROGRESS_CALLBACK_TOKEN }}
           INPUT_REPO_URL: ${{ inputs.repo_url }}
           INPUT_TARGET_BOOT: ${{ inputs.target_spring_boot }}
           INPUT_TARGET_JAVA: ${{ inputs.target_java }}

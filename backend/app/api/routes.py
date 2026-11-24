@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import threading
 from typing import Any, Dict, List, Literal, Optional
 
@@ -115,6 +116,15 @@ class DeleteJobResponse(BaseModel):
     job_id: str
 
 
+class RemoteProgressEventRequest(BaseModel):
+    stage: str
+    message: str
+
+
+class RemoteProgressEventResponse(BaseModel):
+    accepted: bool
+
+
 def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
     """Require an X-API-Key header matching settings.api_key when an API key is configured.
 
@@ -129,6 +139,33 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid X-API-Key header.",
             headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+
+def require_progress_callback_token(
+    x_progress_token: Optional[str] = Header(
+        default=None, alias="X-CodeRevive-Progress-Token"
+    )
+) -> None:
+    """Authenticate the internal GitHub Actions progress-relay endpoint.
+
+    This guards a separate secret from require_api_key: it is sent only by
+    run_migration.py running inside a GitHub Actions runner (see
+    .github/workflows/coderevive-migrate.yml), never by the Angular frontend.
+    Unlike require_api_key, an unset token means the relay is disabled, not
+    open - so this always rejects rather than no-op'ing when unconfigured.
+    """
+    if not settings.progress_callback_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Progress callback token is not configured on this backend.",
+        )
+    if x_progress_token is None or not secrets.compare_digest(
+        x_progress_token, settings.progress_callback_token
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-CodeRevive-Progress-Token header.",
         )
 
 
@@ -571,6 +608,23 @@ def build_api_router() -> APIRouter:
                 "X-Request-ID": "",
             },
         )
+
+    @router.post(
+        "/api/internal/github-actions/runs/{run_id}/events",
+        response_model=RemoteProgressEventResponse,
+        tags=["Internal"],
+        summary="Internal: relay a real-time stage event from a GitHub Actions run",
+        include_in_schema=False,
+    )
+    def relay_gha_progress_event(
+        run_id: int,
+        payload: RemoteProgressEventRequest,
+        _auth: None = Depends(require_progress_callback_token),
+    ) -> Dict[str, Any]:
+        accepted = job_manager.append_remote_event(
+            run_id, payload.stage, payload.message
+        )
+        return {"accepted": accepted}
 
     @router.get(
         "/api/migrations/{job_id}",

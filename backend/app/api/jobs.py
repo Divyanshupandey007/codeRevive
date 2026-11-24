@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import io
 import threading
 from time import sleep
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Set, Tuple
 from uuid import uuid4
 import zipfile
 
@@ -170,6 +170,11 @@ class MigrationJobManager:
             if poll_interval_seconds is not None
             else settings.github_actions_poll_interval_seconds
         )
+        # job_ids that have received at least one real event via
+        # append_remote_event. Once a job is in here, the poll loop's
+        # best-effort step-name/stage guessing must never overwrite its
+        # (now-accurate) stage.
+        self._gha_live_progress: Set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Submission
@@ -377,7 +382,12 @@ class MigrationJobManager:
                     )
                 return
 
-            if run_status.status == "in_progress":
+            live_progress = job_id in self._gha_live_progress
+            if run_status.status == "in_progress" and not live_progress:
+                # Once real events are flowing via append_remote_event, they
+                # are strictly more accurate than anything we can infer here,
+                # so this whole block is a fallback for when the relay isn't
+                # configured, hasn't started posting yet, or dropped out.
                 step_name = self._current_step_name(client, run_id)
                 if step_name and step_name != last_step_name:
                     last_step_name = step_name
@@ -386,6 +396,14 @@ class MigrationJobManager:
                     )
                 if step_name == _GHA_MIGRATION_STEP_NAME:
                     stage = _GHA_MIGRATION_STEP_STAGE_FLOOR
+            elif live_progress:
+                # A real event already set record.stage; don't clobber it with
+                # the generic "running" stage this tick's run-status poll
+                # would otherwise apply below.
+                with self._lock:
+                    record = self._jobs.get(job_id)
+                    if record is not None:
+                        stage = record.stage
 
             self._update_gha_job_status(job_id, status, stage)
             sleep(self._poll_interval)
@@ -399,16 +417,21 @@ class MigrationJobManager:
                 return
             if record.status == "CANCELLED":
                 return
+            status_changed = record.status != status
             record.status = status
             record.stage = stage
             if status == "RUNNING" and record.started_at is None:
                 record.started_at = _utc_now_iso()
-            record.events.append(
-                MigrationJobEvent(
-                    stage=stage,
-                    message=f"GitHub Actions run status: {status}",
+            # Only log a transition, not every 15s poll tick that finds the
+            # run still in the same status - that's what produced dozens of
+            # identical "GitHub Actions run status: RUNNING" lines before.
+            if status_changed:
+                record.events.append(
+                    MigrationJobEvent(
+                        stage=stage,
+                        message=f"GitHub Actions run status: {status}",
+                    )
                 )
-            )
 
     def _finalize_gha_job(
         self,
@@ -440,6 +463,7 @@ class MigrationJobManager:
             record.events.append(
                 MigrationJobEvent(stage=stage, message=message)
             )
+            self._gha_live_progress.discard(job_id)
 
     def _finalize_successful_gha_job(
         self, job_id: str, run_id: int, client: GitHubActionsClient
@@ -528,6 +552,29 @@ class MigrationJobManager:
                 return
             record.stage = stage
             record.events.append(MigrationJobEvent(stage=stage, message=message))
+
+    def append_remote_event(self, run_id: int, stage: str, message: str) -> bool:
+        """Append an event relayed directly from a GitHub Actions-hosted run.
+
+        This is how github_actions-mode jobs get the same fine-grained
+        OPENREWRITE_PASS / VERIFYING_SANDBOX / REPAIRING / ... events that
+        local jobs produce in-process: run_migration.py's progress_callback
+        POSTs each transition here (see app.api.routes' internal endpoint)
+        instead of us trying to infer it by polling run/step status.
+
+        Returns False (and writes nothing) if the run isn't a known, still-
+        active job, e.g. a stale or spoofed run_id, or one that has already
+        finished.
+        """
+        job_id = f"{_GHA_JOB_ID_PREFIX}{run_id}"
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None or record.status not in ("QUEUED", "RUNNING"):
+                return False
+            record.stage = stage
+            record.events.append(MigrationJobEvent(stage=stage, message=message))
+            self._gha_live_progress.add(job_id)
+            return True
 
     def _execute_job(
         self,
