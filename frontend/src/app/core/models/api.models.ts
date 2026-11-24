@@ -89,6 +89,7 @@ export interface MigrationJobRecord {
   summary_path: string | null;
   error: string | null;
   error_type: string | null;
+  gha_run_url: string | null;
 }
 
 export interface JobListResponse {

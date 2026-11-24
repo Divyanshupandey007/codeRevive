@@ -75,6 +75,10 @@ class MigrationJobRecord(BaseModel):
     summary_path: Optional[str] = None
     error: Optional[str] = None
     error_type: Optional[str] = None
+    # Direct link to the run on github.com, so the UI can offer a "View on
+    # GitHub" escape hatch to the real live log when only a coarse run-level
+    # status is available locally (see _poll_github_actions_run).
+    gha_run_url: Optional[str] = None
 
 
 class JobConflictError(RuntimeError):
@@ -112,6 +116,18 @@ def _map_gha_status(run_status: RunStatus) -> Tuple[str, str]:
         return "FAILED", "failed"
     # requested / waiting / pending -> treat as queued
     return "QUEUED", "queued"
+
+
+# The name of the single workflow step (see coderevive-migrate.yml) that
+# actually runs OpenRewrite / Sandbox Verify / AI Repair / Integrity Check.
+# The Actions "list jobs" API only reports whether this *whole* step is
+# in_progress, not which of those four phases is currently active inside it
+# (that detail only exists in the step's own log output, which GitHub does
+# not expose for a still-running step). Once this step starts we at least
+# know we are past Init, so we use it as a floor for the UI progress bar -
+# not a claim that OpenRewrite specifically is what's running right now.
+_GHA_MIGRATION_STEP_NAME = "Run CodeRevive migration"
+_GHA_MIGRATION_STEP_STAGE_FLOOR = "openrewrite"
 
 
 class MigrationJobManager:
@@ -230,6 +246,7 @@ class MigrationJobManager:
             status="QUEUED",
             stage="queued",
             request=request,
+            gha_run_url=dispatch.html_url,
             events=[
                 MigrationJobEvent(
                     stage="queued",
@@ -274,6 +291,22 @@ class MigrationJobManager:
                 )
             return self._github_client
 
+    def _current_step_name(self, client: GitHubActionsClient, run_id: int) -> Optional[str]:
+        """Best-effort: name of the step currently in_progress for this run.
+
+        Used only to move the UI's coarse progress marker; failures here must
+        never interrupt the main status poll, so any error is swallowed.
+        """
+        try:
+            jobs = client.get_job_steps(run_id)
+        except GitHubActionsError:
+            return None
+        for job in jobs:
+            for step in job.steps:
+                if step.status == "in_progress":
+                    return step.name
+        return None
+
     def _poll_github_actions_run(self, job_id: str, run_id: int) -> None:
         client = self._get_github_client()
         cancel_flag = self._cancel_flags.get(job_id)
@@ -283,6 +316,7 @@ class MigrationJobManager:
             else __import__("time").monotonic()
             + settings.github_actions_job_timeout_seconds
         )
+        last_step_name: Optional[str] = None
 
         while True:
             # Honour cancellation before each poll.
@@ -342,6 +376,16 @@ class MigrationJobManager:
                         error_type="WorkflowFailed",
                     )
                 return
+
+            if run_status.status == "in_progress":
+                step_name = self._current_step_name(client, run_id)
+                if step_name and step_name != last_step_name:
+                    last_step_name = step_name
+                    self._append_event(
+                        job_id, "running", f"GitHub Actions step: {step_name}"
+                    )
+                if step_name == _GHA_MIGRATION_STEP_NAME:
+                    stage = _GHA_MIGRATION_STEP_STAGE_FLOOR
 
             self._update_gha_job_status(job_id, status, stage)
             sleep(self._poll_interval)
