@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -28,7 +29,10 @@ from app.ingestion.patch_applicator import (
 )
 from app.llm.base import LLMProvider, LLMProviderError
 from app.llm.factory import LLMFactory
-from app.llm.prompts import CODER_AGENT_SYSTEM_INSTRUCTION, build_coder_prompt
+from app.llm.prompts import (
+    CODER_AGENT_SYSTEM_INSTRUCTION,
+    build_coder_prompt,
+)
 from app.models.agent import FilePatchResult
 from app.models.execution import BuildResult, CompilerError, TestFailure
 from app.models.manifest import (
@@ -53,6 +57,7 @@ from app.orchestrator.java_patch_utils import (
     repair_illegal_java_string_escapes as _repair_illegal_java_string_escapes,
     restore_stripped_java_backslashes as _restore_stripped_java_backslashes,
     validate_java_api_sanity as _validate_java_api_sanity,
+    validate_java_syntax as _validate_java_syntax,
     validate_multiline_java_formatting as _validate_multiline_java_formatting,
 )
 from app.orchestrator.repair_heuristics import (
@@ -216,6 +221,55 @@ def _order_actionable_ancestors_first(
     return [(fp, item_by_path[fp]) for fp in ordered_paths]
 
 
+def _partition_actionable_waves(
+    ordered_items: List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]],
+    ancestors_by_path: Dict[str, Set[str]],
+) -> List[List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]]]:
+    """Group topologically ordered actionable files into dependency-independent waves.
+
+    Files within the same wave do not depend on each other and can safely generate LLM
+    patches concurrently; `pom.xml` always runs alone in the first wave when present.
+    """
+    if len(ordered_items) <= 1:
+        return [ordered_items] if ordered_items else []
+
+    waves: List[List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]]] = []
+    remaining: List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]] = []
+
+    pom_items = [item for item in ordered_items if Path(item[0]).name == "pom.xml"]
+    if pom_items:
+        waves.append(pom_items)
+        remaining = [item for item in ordered_items if Path(item[0]).name != "pom.xml"]
+    else:
+        remaining = list(ordered_items)
+
+    index_by_path = {fp: idx for idx, (fp, _) in enumerate(remaining)}
+    resolved: Set[str] = {fp for fp, _ in pom_items}
+    pending = list(remaining)
+
+    while pending:
+        pending_paths = {fp for fp, _ in pending}
+        wave: List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]] = []
+        next_pending: List[Tuple[str, Tuple[List[CompilerError], List[TestFailure]]]] = []
+        for item in pending:
+            fp = item[0]
+            unresolved_ancs = (ancestors_by_path.get(fp, set()) & pending_paths) - {fp}
+            if not unresolved_ancs:
+                wave.append(item)
+            else:
+                next_pending.append(item)
+        if not wave:
+            # Break any cycle deterministically by taking the first pending item alone
+            wave.append(pending[0])
+            next_pending = pending[1:]
+        wave.sort(key=lambda kv: index_by_path[kv[0]])
+        waves.append(wave)
+        resolved.update(fp for fp, _ in wave)
+        pending = next_pending
+
+    return waves
+
+
 @dataclass
 class _FileWorkItem:
     target: MigrationTarget
@@ -297,12 +351,17 @@ class MigrationOrchestrator:
             self.progress_callback(f"{new_state.value}:{messages[new_state]}")
 
     def _request_patch_and_restore(
-        self, prompt: str, target_file_path: str, source_code: str
+        self,
+        prompt: str,
+        target_file_path: str,
+        source_code: str,
+        temperature: float = 0.1,
     ) -> Tuple[FilePatchResult, Optional[str]]:
         patch = self.llm_provider.generate_structured(
             prompt=prompt,
             response_schema=FilePatchResult,
             system_instruction=CODER_AGENT_SYSTEM_INSTRUCTION,
+            temperature=temperature,
         )
         patch.new_content = _restore_stripped_java_backslashes(
             target_file_path, source_code, patch.new_content
@@ -319,9 +378,10 @@ class MigrationOrchestrator:
         source_code: str,
         migration_rule: str,
         illegal_escape_lines: Optional[Set[int]] = None,
+        temperature: float = 0.1,
     ) -> FilePatchResult:
         patch, fmt_error = self._request_patch_and_restore(
-            prompt, target_file_path, source_code
+            prompt, target_file_path, source_code, temperature=temperature
         )
         if fmt_error:
             print(f" [FORMAT RETRY] {target_file_path}: {fmt_error}")
@@ -331,7 +391,7 @@ class MigrationOrchestrator:
                 "line breaks between every import, annotation, field, and method."
             )
             patch, fmt_error = self._request_patch_and_restore(
-                retry_prompt, target_file_path, source_code
+                retry_prompt, target_file_path, source_code, temperature=temperature
             )
             if fmt_error:
                 raise SecurityViolationError(
@@ -348,7 +408,7 @@ class MigrationOrchestrator:
                 "Update the entire file to fix this issue while preserving all business logic and method contracts."
             )
             patch, fmt_error = self._request_patch_and_restore(
-                sanity_prompt, target_file_path, source_code
+                sanity_prompt, target_file_path, source_code, temperature=max(temperature, 0.25)
             )
             if fmt_error:
                 raise SecurityViolationError(
@@ -359,9 +419,40 @@ class MigrationOrchestrator:
             patch.new_content = _repair_illegal_java_string_escapes(
                 patch.new_content, target_lines=illegal_escape_lines
             )
+
+        java_parser = getattr(self.ast_parser, "parser", None)
+        syntax_error = _validate_java_syntax(
+            target_file_path, source_code, patch.new_content, parser=java_parser
+        )
+        if syntax_error:
+            print(f" [SYNTAX RETRY] {target_file_path}: {syntax_error}")
+            syntax_prompt = (
+                f"{prompt}\n\nCRITICAL SYNTAX CORRECTION: {syntax_error}\n"
+                "Return the COMPLETE, syntactically valid file from the first line through the "
+                "final closing line with every statement, parenthesis, and brace closed. "
+                "Do NOT truncate, summarize, or omit any methods."
+            )
+            patch, fmt_error = self._request_patch_and_restore(
+                syntax_prompt, target_file_path, source_code, temperature=max(temperature, 0.25)
+            )
+            if fmt_error:
+                raise LLMProviderError(
+                    f"Patch formatting validation failed after syntax retry: {fmt_error}"
+                )
+            if target_file_path.endswith(".java") and illegal_escape_lines:
+                patch.new_content = _repair_illegal_java_string_escapes(
+                    patch.new_content, target_lines=illegal_escape_lines
+                )
+            syntax_error_after = _validate_java_syntax(
+                target_file_path, source_code, patch.new_content, parser=java_parser
+            )
+            if syntax_error_after:
+                raise LLMProviderError(
+                    f"Patch validation failed after retry (prevented writing broken/truncated file): {syntax_error_after}"
+                )
         return patch
 
-    def generate_patch(
+    def _build_and_generate_patch(
         self,
         target_file_path: str,
         source_code: str,
@@ -371,8 +462,14 @@ class MigrationOrchestrator:
         runtime_log_excerpt: Optional[str] = None,
         migration_context: Optional[str] = None,
         dependency_context: Optional[str] = None,
+        temperature: float = 0.1,
     ) -> FilePatchResult:
-        self._transition(WorkflowState.GENERATING_PATCH)
+        illegal_escape_lines = {
+            e.line_number
+            for e in (compiler_errors or [])
+            if e.line_number is not None
+            and "illegal escape character" in e.message.lower()
+        }
         prompt = build_coder_prompt(
             target_file_path=target_file_path,
             source_code=source_code,
@@ -383,18 +480,13 @@ class MigrationOrchestrator:
             migration_context=migration_context,
             dependency_context=dependency_context,
         )
-        illegal_escape_lines = {
-            e.line_number
-            for e in (compiler_errors or [])
-            if e.line_number is not None
-            and "illegal escape character" in e.message.lower()
-        }
         patch = self._request_validated_patch(
             prompt,
             target_file_path,
             source_code,
             migration_rule,
             illegal_escape_lines=illegal_escape_lines,
+            temperature=temperature,
         )
 
         if (compiler_errors or failed_tests) and (
@@ -415,8 +507,32 @@ class MigrationOrchestrator:
                 source_code,
                 migration_rule,
                 illegal_escape_lines=illegal_escape_lines,
+                temperature=max(temperature, 0.4),
             )
         return patch
+
+    def generate_patch(
+        self,
+        target_file_path: str,
+        source_code: str,
+        migration_rule: str,
+        compiler_errors: List[CompilerError],
+        failed_tests: List[TestFailure],
+        runtime_log_excerpt: Optional[str] = None,
+        migration_context: Optional[str] = None,
+        dependency_context: Optional[str] = None,
+    ) -> FilePatchResult:
+        self._transition(WorkflowState.GENERATING_PATCH)
+        return self._build_and_generate_patch(
+            target_file_path=target_file_path,
+            source_code=source_code,
+            migration_rule=migration_rule,
+            compiler_errors=compiler_errors,
+            failed_tests=failed_tests,
+            runtime_log_excerpt=runtime_log_excerpt,
+            migration_context=migration_context,
+            dependency_context=dependency_context,
+        )
 
     def _verify_in_sandbox(
         self,
@@ -962,9 +1078,9 @@ class MigrationOrchestrator:
                 ),
             )
 
+            ancestors_by_path: Dict[str, Set[str]] = {}
             if len(ordered_actionable) > 1 and fqcn_to_file:
                 actionable_paths = {fp for fp, _ in ordered_actionable}
-                ancestors_by_path: Dict[str, Set[str]] = {}
                 for fp, _ in ordered_actionable:
                     if fp.endswith(".java"):
                         ancs = expand_type_ancestors(
@@ -1005,29 +1121,43 @@ class MigrationOrchestrator:
                 f"-> {', '.join(fp for fp, _ in ordered_actionable)}"
             )
 
+            waves = _partition_actionable_waves(ordered_actionable, ancestors_by_path)
+            provider_allows_concurrency = bool(
+                getattr(self.llm_provider, "supports_concurrency", False)
+            )
+            configured_concurrency = max(1, int(settings.llm_max_concurrency or 1))
+            total_in_round = len(ordered_actionable)
+            completed_in_round = 0
             repaired_any = False
-            for file_path, (compiler_errors, failed_tests) in ordered_actionable:
-                record = file_records[file_path]
-                record.attempts += 1
-                record.state = FileStatus.GENERATING
-                cur_compiler_sigs = {
-                    re.sub(r"\s+", " ", e.message.strip())
-                    for e in compiler_errors
-                    if e.message and e.message.strip()
-                }
-                is_repeat_compiler_failure = bool(
-                    record.prev_compiler_signatures & cur_compiler_sigs
-                )
-                record.prev_compiler_signatures = cur_compiler_sigs
-                record.errors_encountered = _diagnostics_summary(
-                    compiler_errors, failed_tests
-                )
-                if record.target.is_test:
-                    repaired_test_files.add(file_path)
-                elif is_runtime_pivot:
-                    runtime_repaired_app_files.add(file_path)
 
-                try:
+            for wave in waves:
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    break
+
+                # Prepare all prompts and dependency context for this wave on the main thread
+                # so AST/manifest cache reads stay thread-safe and wave N+1 sees wave N writes.
+                prepared_items: List[Dict[str, object]] = []
+                for file_path, (compiler_errors, failed_tests) in wave:
+                    record = file_records[file_path]
+                    record.attempts += 1
+                    record.state = FileStatus.GENERATING
+                    cur_compiler_sigs = {
+                        re.sub(r"\s+", " ", e.message.strip())
+                        for e in compiler_errors
+                        if e.message and e.message.strip()
+                    }
+                    is_repeat_compiler_failure = bool(
+                        record.prev_compiler_signatures & cur_compiler_sigs
+                    )
+                    record.prev_compiler_signatures = cur_compiler_sigs
+                    record.errors_encountered = _diagnostics_summary(
+                        compiler_errors, failed_tests
+                    )
+                    if record.target.is_test:
+                        repaired_test_files.add(file_path)
+                    elif is_runtime_pivot:
+                        runtime_repaired_app_files.add(file_path)
+
                     source_code = (self.repo_path / file_path).read_text(
                         encoding="utf-8"
                     )
@@ -1064,54 +1194,168 @@ class MigrationOrchestrator:
                     if is_repeat_compiler_failure:
                         repeat_note = (
                             "REPEAT REPAIR FAILURE: Your previous patch produced the EXACT same compiler error(s) again. "
-                            "Do NOT keep calling the failing method with incompatible argument types; rewrite the offending line(s) "
-                            "using a compatible method signature from 'Updated local project dependencies' or execute the query/logic "
-                            "directly via Session / CriteriaBuilder / EntityManager."
+                            "Carefully inspect EVERY failing line and compiler diagnostic below (such as duplicate/ambiguous "
+                            "imports, mismatched method overloads, or invalid argument types) and genuinely rewrite the "
+                            "offending lines so the file compiles cleanly."
                         )
                         effective_repair_context = (
                             f"{repair_context}\n\n{repeat_note}"
                             if repair_context
                             else repeat_note
                         )
-                    patch = self.generate_patch(
-                        file_path,
-                        source_code,
-                        effective_rule,
-                        compiler_errors,
-                        failed_tests,
-                        runtime_log_excerpt=effective_excerpt,
-                        migration_context=effective_repair_context,
-                        dependency_context=dep_context,
+                    effective_temperature = (
+                        0.3
+                        if is_repeat_compiler_failure
+                        else (0.25 if record.attempts >= 2 else 0.1)
                     )
-                    _, diff = apply_patch_with_diff(
-                        self.repo_path, patch, expected_target_path=file_path
+                    prepared_items.append(
+                        {
+                            "file_path": file_path,
+                            "record": record,
+                            "source_code": source_code,
+                            "effective_rule": effective_rule,
+                            "compiler_errors": compiler_errors,
+                            "failed_tests": failed_tests,
+                            "effective_excerpt": effective_excerpt,
+                            "effective_repair_context": effective_repair_context,
+                            "dep_context": dep_context,
+                            "temperature": effective_temperature,
+                        }
                     )
-                    if diff and diff.strip():
-                        self._manifest_cache.pop(file_path, None)
-                        record.state = FileStatus.PATCH_APPLIED
-                        record.applied_by = "llm"
-                        record.diff = diff
-                        repaired_any = True
-                        if modified_files is not None:
-                            modified_files.add(file_path)
-                    elif record.applied_by is not None:
-                        record.state = FileStatus.PATCH_APPLIED
-                    else:
-                        record.state = FileStatus.PENDING
-                except LLMProviderError as exc:
-                    record.state = FileStatus.FAILED
-                    record.errors_encountered.append(f"LLM generation failed: {exc}")
+
+                worker_count = (
+                    min(len(prepared_items), configured_concurrency)
+                    if provider_allows_concurrency
+                    else 1
+                )
+
+                results_by_path: Dict[
+                    str, Tuple[Optional[FilePatchResult], Optional[Exception]]
+                ] = {}
+
+                if worker_count <= 1:
+                    for item in prepared_items:
+                        if self._cancel_event is not None and self._cancel_event.is_set():
+                            break
+                        fp = str(item["file_path"])
+                        completed_in_round += 1
+                        if self.progress_callback:
+                            self.state = WorkflowState.GENERATING_PATCH
+                            self.progress_callback(
+                                f"GENERATING_PATCH:Generating AI repair patch for {Path(fp).name} ({completed_in_round}/{total_in_round})"
+                            )
+                        try:
+                            patch = self._build_and_generate_patch(
+                                fp,
+                                str(item["source_code"]),
+                                str(item["effective_rule"]),
+                                item["compiler_errors"],  # type: ignore[arg-type]
+                                item["failed_tests"],  # type: ignore[arg-type]
+                                runtime_log_excerpt=item["effective_excerpt"],  # type: ignore[arg-type]
+                                migration_context=item["effective_repair_context"],  # type: ignore[arg-type]
+                                dependency_context=item["dep_context"],  # type: ignore[arg-type]
+                                temperature=float(item["temperature"]),  # type: ignore[arg-type]
+                            )
+                            results_by_path[fp] = (patch, None)
+                        except (LLMProviderError, SecurityViolationError) as exc:
+                            results_by_path[fp] = (None, exc)
+                else:
+                    self.state = WorkflowState.GENERATING_PATCH
                     if self.progress_callback:
                         self.progress_callback(
-                            f"REPAIRING:LLM generation failed for {file_path}: {exc}"
+                            f"GENERATING_PATCH:Generating AI repair patches for {len(prepared_items)} independent file(s) ({worker_count} workers)"
                         )
-                except SecurityViolationError as exc:
-                    record.state = FileStatus.REJECTED
-                    record.errors_encountered.append(f"Guardrail rejected patch: {exc}")
-                    if self.progress_callback:
-                        self.progress_callback(
-                            f"REPAIRING:Guardrail rejected patch for {file_path}: {exc}"
+
+                    def _run_item(
+                        item: Dict[str, object],
+                    ) -> Tuple[str, Optional[FilePatchResult], Optional[Exception]]:
+                        fp = str(item["file_path"])
+                        if self._cancel_event is not None and self._cancel_event.is_set():
+                            return fp, None, None
+                        try:
+                            patch = self._build_and_generate_patch(
+                                fp,
+                                str(item["source_code"]),
+                                str(item["effective_rule"]),
+                                item["compiler_errors"],  # type: ignore[arg-type]
+                                item["failed_tests"],  # type: ignore[arg-type]
+                                runtime_log_excerpt=item["effective_excerpt"],  # type: ignore[arg-type]
+                                migration_context=item["effective_repair_context"],  # type: ignore[arg-type]
+                                dependency_context=item["dep_context"],  # type: ignore[arg-type]
+                                temperature=float(item["temperature"]),  # type: ignore[arg-type]
+                            )
+                            return fp, patch, None
+                        except (LLMProviderError, SecurityViolationError) as exc:
+                            return fp, None, exc
+
+                    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                        futures = [pool.submit(_run_item, item) for item in prepared_items]
+                        for fut in as_completed(futures):
+                            fp, patch, exc = fut.result()
+                            results_by_path[fp] = (patch, exc)
+                            completed_in_round += 1
+                            if self.progress_callback and exc is None and patch is not None:
+                                self.progress_callback(
+                                    f"GENERATING_PATCH:Generated AI repair patch for {Path(fp).name} ({completed_in_round}/{total_in_round})"
+                                )
+
+                # Apply patches and update records deterministically on the main thread
+                for item in prepared_items:
+                    fp = str(item["file_path"])
+                    if fp not in results_by_path:
+                        continue
+                    record: _FileWorkItem = item["record"]  # type: ignore[assignment]
+                    patch, exc = results_by_path[fp]
+                    if exc is not None:
+                        if isinstance(exc, LLMProviderError):
+                            record.state = FileStatus.FAILED
+                            record.errors_encountered.append(f"LLM generation failed: {exc}")
+                            print(f" [LLM ERROR] {fp}: {exc}")
+                            if self.progress_callback:
+                                self.progress_callback(
+                                    f"REPAIRING:LLM generation failed for {fp}: {exc}"
+                                )
+                        elif isinstance(exc, SecurityViolationError):
+                            record.state = FileStatus.REJECTED
+                            record.errors_encountered.append(f"Guardrail rejected patch: {exc}")
+                            print(f" [GUARDRAIL REJECTED] {fp}: {exc}")
+                            if self.progress_callback:
+                                self.progress_callback(
+                                    f"REPAIRING:Guardrail rejected patch for {fp}: {exc}"
+                                )
+                        continue
+                    if patch is None:
+                        continue
+                    try:
+                        _, diff = apply_patch_with_diff(
+                            self.repo_path, patch, expected_target_path=fp
                         )
+                        if diff and diff.strip():
+                            self._manifest_cache.pop(fp, None)
+                            record.state = FileStatus.PATCH_APPLIED
+                            record.applied_by = "llm"
+                            record.diff = diff
+                            repaired_any = True
+                            if modified_files is not None:
+                                modified_files.add(fp)
+                        elif record.applied_by is not None:
+                            record.state = FileStatus.PATCH_APPLIED
+                        else:
+                            record.state = FileStatus.PENDING
+                    except SecurityViolationError as sec_exc:
+                        record.state = FileStatus.REJECTED
+                        record.errors_encountered.append(
+                            f"Guardrail rejected patch: {sec_exc}"
+                        )
+                        print(f" [GUARDRAIL REJECTED] {fp}: {sec_exc}")
+                        if self.progress_callback:
+                            self.progress_callback(
+                                f"REPAIRING:Guardrail rejected patch for {fp}: {sec_exc}"
+                            )
+
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                build_result = _CANCELLED_BUILD_RESULT
+                break
 
             if not repaired_any:
                 if self.progress_callback:

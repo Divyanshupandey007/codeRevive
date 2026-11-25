@@ -320,8 +320,60 @@ def test_gha_inputs_include_all_required_fields():
     assert inputs["branch"] == "migration/spring-boot-3"
     assert inputs["openrewrite_mode"] == "hybrid"
     assert inputs["retry_budget"] == "5"
+    assert "llm_provider" in inputs
+    assert "llm_model" in inputs
     # "clean" is applied unconditionally by the workflow itself, not sent as input.
     assert "clean" not in inputs
+
+
+def test_gha_logs_do_not_mention_github_actions_or_dispatched():
+    fake = _FakeGHAClient()
+    fake.status_sequence = [
+        RunStatus(run_id=9001, status="queued"),
+        RunStatus(run_id=9001, status="in_progress"),
+        RunStatus(run_id=9001, status="completed", conclusion="success"),
+    ]
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0.02,
+    )
+    record = manager.submit(_make_request())
+    final = _wait_for(manager, record.job_id, lambda r: r.status == "COMPLETED")
+    assert final is not None
+    for ev in final.events:
+        lower = ev.message.lower()
+        assert "github actions" not in lower
+        assert "dispatched" not in lower
+
+
+def test_cancel_and_resubmit_same_repo_cleans_old_cancelled_job():
+    fake = _FakeGHAClient()
+    fake.repeat_status = RunStatus(run_id=9001, status="in_progress")
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0.02,
+    )
+    first = manager.submit(_make_request())
+    _wait_for(manager, first.job_id, lambda r: r.status == "RUNNING")
+    assert manager.cancel(first.job_id) is True
+
+    fake.dispatch_result = WorkflowDispatchResult(
+        run_id=9002, run_number=2, status="queued", html_url=None, raw={}
+    )
+    fake.repeat_status = None
+    fake.status_sequence = [
+        RunStatus(run_id=9002, status="completed", conclusion="success")
+    ]
+    second = manager.submit(_make_request())
+    assert second.job_id == "gha_9002"
+    assert manager.get(first.job_id) is None
+    final = _wait_for(manager, second.job_id, lambda r: r.status == "COMPLETED")
+    assert final is not None
+    assert final.status == "COMPLETED"
 
 
 def test_execution_mode_defaults_to_local():

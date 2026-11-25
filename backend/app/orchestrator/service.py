@@ -73,13 +73,75 @@ def _repository_presets() -> list[dict[str, str]]:
     ]
 
 
+_REMOTE_LLM_CACHE: Dict[str, Any] = {"checked_at": 0.0, "provider": None, "model": None}
+_REMOTE_LLM_CACHE_TTL_SECONDS = 60.0
+
+
+def _resolve_remote_gha_llm_model(provider: str) -> Optional[str]:
+    """In github_actions mode, if the backend host didn't explicitly configure a
+    model env var, try reading the workflow's repository variables so the UI
+    displays the real active production LLM model instead of a static default."""
+    if settings.execution_mode != "github_actions":
+        return None
+    if not (settings.github_token and settings.github_owner and settings.github_repo):
+        return None
+
+    import time
+
+    now = time.monotonic()
+    if (
+        _REMOTE_LLM_CACHE.get("provider") == provider
+        and now - float(_REMOTE_LLM_CACHE.get("checked_at") or 0.0)
+        < _REMOTE_LLM_CACHE_TTL_SECONDS
+    ):
+        return _REMOTE_LLM_CACHE.get("model")
+
+    var_names = ["CODEREVIVE_LLM_MODEL"]
+    provider_var = {
+        "gemini": "CODEREVIVE_GEMINI_MODEL",
+        "nvidia": "CODEREVIVE_NVIDIA_MODEL",
+        "openrouter": "CODEREVIVE_OPENROUTER_MODEL",
+    }.get(provider)
+    if provider_var:
+        var_names.append(provider_var)
+
+    resolved: Optional[str] = None
+    try:
+        from app.integrations.github_actions_client import GitHubActionsClient
+
+        with GitHubActionsClient(
+            token=settings.github_token,
+            owner=settings.github_owner,
+            repo=settings.github_repo,
+            workflow_id=settings.github_workflow_id,
+            base_url=settings.github_api_base_url,
+            timeout_seconds=5.0,
+        ) as client:
+            for name in var_names:
+                val = client.get_repo_variable(name)
+                if val:
+                    resolved = val
+                    break
+    except Exception:
+        resolved = None
+
+    _REMOTE_LLM_CACHE["checked_at"] = now
+    _REMOTE_LLM_CACHE["provider"] = provider
+    _REMOTE_LLM_CACHE["model"] = resolved
+    return resolved
+
+
 def get_active_config() -> Dict[str, Any]:
-    """Return active non-secret migration defaults from backend/.env + config.py."""
-    llm_model_by_provider = {
-        "gemini": settings.gemini_model,
-        "nvidia": settings.nvidia_model,
-        "openrouter": settings.openrouter_model,
-    }
+    """Return active non-secret migration defaults from backend/.env + environment."""
+    provider = settings.resolve_llm_provider()
+    model = settings.resolve_llm_model(provider)
+    if (
+        settings.execution_mode == "github_actions"
+        and not settings.has_explicit_llm_model_config(provider)
+    ):
+        remote_model = _resolve_remote_gha_llm_model(provider)
+        if remote_model:
+            model = remote_model
     return {
         "repository_presets": _repository_presets(),
         "repo_url": settings.repo_url,
@@ -89,8 +151,8 @@ def get_active_config() -> Dict[str, Any]:
         "use_openrewrite": settings.use_openrewrite,
         "openrewrite_mode": settings.openrewrite_mode,
         "default_retry_budget": settings.default_retry_budget,
-        "llm_provider": settings.llm_provider,
-        "llm_model": llm_model_by_provider.get(settings.llm_provider, settings.llm_provider),
+        "llm_provider": provider,
+        "llm_model": model,
         "workspace_root": str(settings.resolved_workspace_root),
     }
 

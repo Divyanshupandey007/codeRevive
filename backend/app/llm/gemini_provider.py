@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Type, TypeVar
 
 from pydantic import BaseModel
@@ -5,27 +6,38 @@ from pydantic import BaseModel
 from app.config import settings
 from app.llm.base import (
     LLMProvider,
-    LLMStructuredOutputError,
     call_with_retry,
-    extract_json_payload,
+    parse_structured_json,
 )
 
 T = TypeVar("T", bound=BaseModel)
 
 
 class GeminiProvider(LLMProvider):
+    supports_concurrency: bool = True
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         max_retries: int = 4,
     ):
-        resolved_key = settings.gemini_api_key if api_key is None else api_key
+        resolved_key = (
+            api_key
+            if api_key is not None
+            else (
+                settings.gemini_api_key
+                or os.environ.get("CODEREVIVE_GEMINI_API_KEY", "")
+                or os.environ.get("GEMINI_API_KEY", "")
+            )
+        ).strip()
         if not resolved_key:
             raise ValueError(
                 "No Gemini API key configured. Set CODEREVIVE_GEMINI_API_KEY in backend/.env"
             )
-        self.model = settings.gemini_model if model is None else model
+        self.model = (
+            settings.resolve_llm_model("gemini") if model is None else model
+        )
         self._max_retries = max(1, max_retries)
 
         try:
@@ -85,11 +97,4 @@ class GeminiProvider(LLMProvider):
             return response.parsed
 
         raw_text = response.text or ""
-        cleaned = extract_json_payload(raw_text)
-        try:
-            return response_schema.model_validate_json(cleaned)
-        except Exception as exc:
-            raise LLMStructuredOutputError(
-                f"Gemini response could not be parsed into {response_schema.__name__}: {exc}\n"
-                f"Raw response (first 500 chars): {raw_text[:500]}"
-            ) from exc
+        return parse_structured_json(raw_text, response_schema, provider_name="Gemini")

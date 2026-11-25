@@ -11,7 +11,7 @@ from app.llm.base import (
     LLMProvider,
     LLMProviderError,
     LLMStructuredOutputError,
-    extract_json_payload,
+    parse_structured_json,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -38,6 +38,8 @@ def _extract_content_text(message: Dict[str, Any]) -> str:
 
 class OpenRouterProvider(LLMProvider):
     """OpenRouter Chat Completions provider (default model: openai/gpt-oss-120b)."""
+
+    supports_concurrency: bool = True
 
     def __init__(
         self,
@@ -67,7 +69,9 @@ class OpenRouterProvider(LLMProvider):
         self.base_url = (
             settings.openrouter_base_url if base_url is None else base_url
         ).rstrip("/")
-        self.model = settings.openrouter_model if model is None else model
+        self.model = (
+            settings.resolve_llm_model("openrouter") if model is None else model
+        )
         self.reasoning_enabled = (
             settings.openrouter_reasoning_enabled
             if reasoning_enabled is None
@@ -259,11 +263,6 @@ class OpenRouterProvider(LLMProvider):
             raise LLMStructuredOutputError(
                 f"OpenRouter returned empty content for {response_schema.__name__}{hint}."
             )
-        cleaned = extract_json_payload(raw_text)
-        try:
-            return response_schema.model_validate_json(cleaned)
-        except Exception as exc:
-            raise LLMStructuredOutputError(
-                f"OpenRouter response could not be parsed into {response_schema.__name__}: {exc}\n"
-                f"Raw response (first 500 chars): {raw_text[:500]}"
-            ) from exc
+        return parse_structured_json(
+            raw_text, response_schema, provider_name="OpenRouter"
+        )

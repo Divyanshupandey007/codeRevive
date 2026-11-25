@@ -22,7 +22,10 @@ CODER_AGENT_SYSTEM_INSTRUCTION=(
     "modifiers (e.g. keep '@Autowired' and 'private' on separate lines).\n"
     "7. Preserve every backslash inside Java string literals and regexes when "
     "encoding JSON (e.g., write '\\\\\\\\s', '\\\\\\\\S', '\\\\\\\\d', '\\\\\\\\/' "
-    "in JSON so decoded Java keeps '\\\\s', '\\\\S', '\\\\d', '\\\\/')."
+    "in JSON so decoded Java keeps '\\\\s', '\\\\S', '\\\\d', '\\\\/').\n"
+    "8. Keep all non-ASCII / Unicode characters (such as Chinese, Japanese, or "
+    "accented text in comments and string literals) directly as raw UTF-8 characters "
+    "inside JSON strings - NEVER encode them as \\\\uXXXX escape sequences."
 )
 
 def _format_diagnostics(compiler_errors:List[CompilerError],failed_tests:List[TestFailure])->str:
@@ -82,30 +85,37 @@ def _build_compiler_repair_hints(compiler_errors:List[CompilerError])->str:
         )
 
     if any(
+        "is ambiguous" in m
+        or "already defined by the single-type-import" in m
+        for m in lower_msgs
+    ):
+        notes.append(
+            "Note on ambiguous / duplicate class imports:\n"
+            "- Java forbids importing two different classes that share the same simple name in one file "
+            "(for example two different `SecurityScheme`, `Tag`, `Parameter`, `Query`, or `Predicate` classes).\n"
+            "- Remove the conflicting single-type `import` statement (keep at most ONE import for that simple name) "
+            "and refer to the other type by its fully-qualified class name everywhere it is used in the file."
+        )
+
+    if any(
         (
             "cannot be converted to java.lang.string" in m
-            and ("predicate" in m or "criterion" in m)
+            and ("predicate" in m or "criterion" in m or "criteriaquery" in m)
         )
         or (
             ("no suitable method found" in m or "cannot be applied to given types" in m)
-            and ("predicate" in m or "pagerequest" in m)
+            and ("predicate" in m or "pagerequest" in m or "criteriaquery" in m or "jakarta.persistence.criteria" in m)
         )
+        or "is not a functional interface" in m
         or "conforms to java.util.list<jakarta.persistence.criteria.predicate>" in m
         for m in lower_msgs
     ):
         notes.append(
-            "Note on Criteria/Predicate argument type mismatch:\n"
-            "- `Predicate[]` (or `Predicate...` varargs) CANNOT be passed to an HQL method "
-            "expecting `String` (such as `find(String hql, Object...)` or `findPage(Page, String hql, Object...)`).\n"
-            "- Multiple varargs `(Predicate, Predicate, ...)` CANNOT be passed directly to a method expecting "
-            "`List<Predicate>`; wrap them in `Arrays.asList(...)` or `List.of(...)` and match EVERY parameter type "
-            "(for example `PageRequest` vs `Page`) declared in `Updated local project dependencies`.\n"
-            "- If the DAO / dependency interface has no `Predicate` or `List<Predicate>` overload for this operation "
-            "(or this class must keep a `Predicate...` method contract while the DAO only exposes `List<Predicate>` or HQL), "
-            "either adapt via `Arrays.asList(...)` to the exact DAO method in `Updated local project dependencies`, "
-            "rewrite the call using HQL if `find(String hql, Object...)` is available (removing any now-unused `Predicate` variables), "
-            "or execute the query directly via `getSession()` / `EntityManager` using JPA `CriteriaBuilder cb = session.getCriteriaBuilder()`, "
-            "`CriteriaQuery<T> cq = cb.createQuery(...)`, `Root<T> root = cq.from(...)`, and `cq.where(...)`."
+            "Note on Criteria / Predicate / DAO overload type mismatch:\n"
+            "- `jakarta.persistence.criteria.Predicate` is NOT a functional interface — NEVER pass a lambda expression where a `Predicate` is expected; build predicates using `CriteriaBuilder`.\n"
+            "- `Predicate[]`, `CriteriaQuery<T>`, or `jakarta.persistence.criteria.Order` CANNOT be passed to a DAO method whose signature expects `String hql`, `Predicate...`, or `(String orderBy, boolean isAsc, Predicate...)`.\n"
+            "- Check the EXACT parameter types and order listed in the compiler error and `Updated local project dependencies` (for example pass `Arrays.asList(...)` for `List<Predicate>`, or `(orderFieldName, isAsc, predicates...)` for an ordered finder).\n"
+            "- If you already built a `CriteriaQuery<T> cq`, execute it directly via `getSession().createQuery(cq)` / `entityManager.createQuery(cq)` (e.g. `.uniqueResult()`, `.getResultList()`, or `.setMaxResults(1).uniqueResult()`) instead of passing `cq` into a DAO helper that expects `String` or `Predicate...`."
         )
 
     if any("method root(" in m and "criteriabuilder" in m for m in lower_msgs):
@@ -113,6 +123,16 @@ def _build_compiler_repair_hints(compiler_errors:List[CompilerError])->str:
             "Note on `CriteriaBuilder.root(...)`: `CriteriaBuilder` and `HibernateCriteriaBuilder` "
             "do NOT have a `.root(Class)` method. Create a `CriteriaQuery<T> cq = cb.createQuery(Entity.class)` "
             "first and obtain the root with `Root<T> root = cq.from(Entity.class)`."
+        )
+
+    if any("cannot find symbol" in m for m in lower_msgs):
+        notes.append(
+            "Note on `cannot find symbol` errors:\n"
+            "- Only reference local variables, fields, and methods that are actually declared in this class, "
+            "its superclass, or `Updated local project dependencies` — never invent undeclared fields or helper methods.\n"
+            "- If a method uses JPA Criteria (`CriteriaBuilder`, `CriteriaQuery`, `Root`), declare them locally "
+            "inside that method using the class's existing Hibernate/JPA session or `EntityManager` accessor, "
+            "or call existing DAO/repository methods."
         )
 
     if any(

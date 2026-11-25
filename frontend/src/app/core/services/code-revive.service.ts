@@ -16,6 +16,8 @@ import {
 
 export type BackendStatus = 'checking' | 'connected' | 'disconnected';
 
+const ACTIVE_JOB_STORAGE_KEY = 'coderevive_active_job_id';
+
 /**
  * Single injectable facade over the CodeRevive FastAPI backend.
  * All cross-component state lives here as signals.
@@ -35,6 +37,34 @@ export class CodeReviveService {
   readonly jobs = signal<MigrationJobRecord[]>([]);
   readonly jobsTotal = signal(0);
   readonly latestAvailable = signal<boolean | null>(null);
+  readonly activeJobId = signal<string | null>(this.readStoredJobId());
+
+  private readStoredJobId(): string | null {
+    if (typeof sessionStorage === 'undefined') {
+      return null;
+    }
+    try {
+      return sessionStorage.getItem(ACTIVE_JOB_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  setActiveJobId(jobId: string | null): void {
+    this.activeJobId.set(jobId);
+    if (typeof sessionStorage === 'undefined') {
+      return;
+    }
+    try {
+      if (jobId) {
+        sessionStorage.setItem(ACTIVE_JOB_STORAGE_KEY, jobId);
+      } else {
+        sessionStorage.removeItem(ACTIVE_JOB_STORAGE_KEY);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }
 
   /** GET /api/health — liveness probe used by the top-nav status pill. */
   checkHealth(): void {
@@ -51,8 +81,8 @@ export class CodeReviveService {
   }
 
   /** GET /api/config — active non-secret backend defaults (LLM provider, targets). */
-  loadConfig(): void {
-    if (this.config()) {
+  loadConfig(force = false): void {
+    if (!force && this.config()) {
       return;
     }
     this.http
@@ -64,7 +94,7 @@ export class CodeReviveService {
       .subscribe();
   }
 
-  /** GET /api/migrations/jobs — newest-first job history for the launcher. */
+  /** GET /api/migrations/jobs — newest-first active jobs list. */
   refreshJobs(status?: JobStatus): void {
     let params = new HttpParams().set('limit', 50).set('offset', 0);
     if (status) {
@@ -77,6 +107,10 @@ export class CodeReviveService {
           this.jobs.set(res.items);
           this.jobsTotal.set(res.total);
           this.latestAvailable.set(res.latest_available ?? null);
+          const currentActive = this.activeJobId();
+          if (currentActive && !res.items.some((j) => j.job_id === currentActive)) {
+            this.setActiveJobId(res.items[0]?.job_id ?? null);
+          }
         }),
         catchError(() => of(null))
       )
@@ -85,7 +119,9 @@ export class CodeReviveService {
 
   /** POST /api/migrations/jobs — queue an async migration job (202). */
   submitJob(request: MigrationJobRequest): Observable<MigrationJobRecord> {
-    return this.http.post<MigrationJobRecord>(`${this.api}/migrations/jobs`, request);
+    return this.http.post<MigrationJobRecord>(`${this.api}/migrations/jobs`, request).pipe(
+      tap((job) => this.setActiveJobId(job.job_id))
+    );
   }
 
   /** GET /api/migrations/jobs/{id} — job status + result. */

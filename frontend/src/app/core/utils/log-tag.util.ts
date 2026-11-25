@@ -19,42 +19,69 @@ const TAGS = {
 
 type TagKey = keyof typeof TAGS;
 
-/**
- * Classify a backend progress event into a colored console tag.
- * Backend emits "stage:message" strings; the stage prefix drives the tag.
- */
-export function eventToLogLine(event: MigrationJobEvent): LogLine {
-  const hay = `${event.stage} ${event.message}`.toLowerCase();
-  let key: TagKey = 'default';
-  if (hay.includes('error') || hay.includes('fail') || hay.includes('exception') || hay.includes('violation')) {
-    key = 'error';
-  } else if (hay.includes('openrewrite')) {
-    key = 'openrewrite';
-  } else if (hay.includes('repair') || hay.includes('llm') || hay.includes('ai_') || hay.includes('patch')) {
-    key = 'repair';
-  } else if (hay.includes('sandbox') || hay.includes('docker') || hay.includes('container')) {
-    key = 'sandbox';
-  } else if (
-    hay.includes('build') ||
-    hay.includes('maven') ||
-    hay.includes('test') ||
-    hay.includes('verif') ||
-    hay.includes('integrity') ||
-    hay.includes('commit')
-  ) {
-    key = 'build';
-  }
-  const t = TAGS[key];
+const ERROR_RE = /\b(error|fail|failed|failure|exception|violation|violations|aborted|timeout)\b/i;
+const OPENREWRITE_RE = /\bopenrewrite\b/i;
+const REPAIR_RE = /\b(repair|repairing|llm|ai_repair|generating_patch|patch|patched)\b/i;
+const SANDBOX_RE = /\b(sandbox|docker|container)\b/i;
+const BUILD_RE = /\b(build|maven|test|tests|verif\w*|integrity|commit|commiting|committing)\b/i;
+
+/** Normalize raw backend progress text so production logs match local logs and never mention GitHub Actions. */
+export function sanitizeLogMessage(rawMessage: string): string {
+  let message = (rawMessage ?? '').trim();
+
+  // Normalize any legacy/remote dispatch or GHA phrasing defensively
+  message = message.replace(
+    /^Migration dispatched to GitHub Actions run \d+ for\s+/i,
+    'Migration job queued for '
+  );
+  message = message.replace(
+    /^GitHub Actions run \d+ completed successfully\.?$/i,
+    'Migration completed successfully.'
+  );
+  message = message.replace(
+    /^GitHub Actions run status:\s*(.+)$/i,
+    (_m, status: string) => `Migration status: ${status}`
+  );
+  message = message.replace(/^GitHub Actions step:\s*/i, '');
+  message = message.replace(/GitHub Actions run \d+/gi, 'Migration run');
+  message = message.replace(/GitHub Actions(?:\s+runner)?/gi, 'Migration worker');
 
   // Truncate absolute workspace paths in orchestration lines so real users
   // see the repo name instead of a machine-specific path.
-  let message = event.message;
-  const orchestratingMatch = /^orchestrating:(.+)$/i.exec(event.message);
+  const orchestratingMatch = /^orchestrating:(.+)$/i.exec(message);
   if (orchestratingMatch) {
     const fullPath = orchestratingMatch[1].trim();
     const lastSegment = fullPath.split(/[\\/]/).filter(Boolean).pop() ?? fullPath;
     message = `orchestrating:${lastSegment}`;
   }
 
+  return message;
+}
+
+/**
+ * Classify a backend progress event into a colored console tag.
+ * Backend emits "stage:message" strings; the stage prefix drives the tag.
+ */
+export function eventToLogLine(event: MigrationJobEvent): LogLine {
+  const message = sanitizeLogMessage(event.message);
+  const stage = (event.stage ?? '').trim().toLowerCase();
+  const hay = `${stage} ${message}`;
+
+  let key: TagKey = 'default';
+  if (stage === 'queued' || stage === 'starting' || stage === 'ingesting' || stage === 'orchestrating') {
+    key = ERROR_RE.test(message) ? 'error' : 'default';
+  } else if (ERROR_RE.test(hay)) {
+    key = 'error';
+  } else if (OPENREWRITE_RE.test(hay)) {
+    key = 'openrewrite';
+  } else if (REPAIR_RE.test(hay)) {
+    key = 'repair';
+  } else if (SANDBOX_RE.test(hay)) {
+    key = 'sandbox';
+  } else if (BUILD_RE.test(hay)) {
+    key = 'build';
+  }
+
+  const t = TAGS[key];
   return { timestamp: event.timestamp, tag: t.tag, tagClass: t.tagClass, message };
 }

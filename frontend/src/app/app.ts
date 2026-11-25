@@ -1,4 +1,4 @@
-import { Component } from '@angular/core';
+import { ChangeDetectionStrategy, Component } from '@angular/core';
 import { RouterOutlet } from '@angular/router';
 
 import { TopNav } from './shared/top-nav/top-nav';
@@ -7,6 +7,7 @@ import { TopNav } from './shared/top-nav/top-nav';
   selector: 'app-root',
   imports: [RouterOutlet, TopNav],
   templateUrl: './app.html',
-  styleUrl: './app.scss'
+  styleUrl: './app.scss',
+  changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class App {}

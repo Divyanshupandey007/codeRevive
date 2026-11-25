@@ -1,5 +1,8 @@
 import re
-from typing import Dict, List, Optional, Set
+import threading
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+_SYNTAX_PARSE_LOCK = threading.Lock()
 
 _GLUED_ANNOTATION_MODIFIER_RE = re.compile(
     r"@(?:Override|Autowired|Bean|Service|Configuration|Component|Repository|RestController|Controller|ControllerAdvice|Profile|Test|Transactional|PreAuthorize)"
@@ -72,6 +75,178 @@ def validate_java_api_sanity(
             "Remove EVERY Hibernate 5 reference—including inline fully-qualified names—and migrate them "
             "to Hibernate 6 / Jakarta Persistence Criteria."
         )
+    return None
+
+
+def _check_java_delimiter_balance(source: str) -> Optional[str]:
+    """Scan Java source outside comments/strings/chars for unclosed strings or unbalanced delimiters."""
+    n = len(source)
+    i = 0
+    state = "code"
+    braces = 0
+    parens = 0
+    brackets = 0
+
+    while i < n:
+        ch = source[i]
+        if state == "code":
+            if source.startswith("//", i):
+                state = "line_comment"
+                i += 2
+                continue
+            if source.startswith("/*", i):
+                state = "block_comment"
+                i += 2
+                continue
+            if source.startswith('"""', i):
+                state = "text_block"
+                i += 3
+                continue
+            if ch == '"':
+                state = "string"
+                i += 1
+                continue
+            if ch == "'":
+                state = "char"
+                i += 1
+                continue
+            if ch == "{":
+                braces += 1
+            elif ch == "}":
+                braces -= 1
+            elif ch == "(":
+                parens += 1
+            elif ch == ")":
+                parens -= 1
+            elif ch == "[":
+                brackets += 1
+            elif ch == "]":
+                brackets -= 1
+            i += 1
+        elif state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+        elif state == "block_comment":
+            if source.startswith("*/", i):
+                state = "code"
+                i += 2
+            else:
+                i += 1
+        elif state == "text_block":
+            if source.startswith('"""', i):
+                state = "code"
+                i += 3
+            elif ch == "\\" and i + 1 < n:
+                i += 2
+            else:
+                i += 1
+        elif state == "string":
+            if ch == "\\" and i + 1 < n:
+                i += 2
+            elif ch == '"':
+                state = "code"
+                i += 1
+            elif ch == "\n":
+                return "unterminated string literal"
+            else:
+                i += 1
+        elif state == "char":
+            if ch == "\\" and i + 1 < n:
+                i += 2
+            elif ch == "'":
+                state = "code"
+                i += 1
+            elif ch == "\n":
+                return "unterminated character literal"
+            else:
+                i += 1
+
+    if state in ("string", "text_block", "block_comment", "char"):
+        return f"unclosed {state.replace('_', ' ')} at end of file (file appears truncated)"
+    if braces != 0 or parens != 0 or brackets != 0:
+        parts: List[str] = []
+        if braces != 0:
+            parts.append(f"braces off by {braces:+d}")
+        if parens != 0:
+            parts.append(f"parentheses off by {parens:+d}")
+        if brackets != 0:
+            parts.append(f"brackets off by {brackets:+d}")
+        return f"unbalanced delimiters ({', '.join(parts)}) — file appears truncated or missing closing syntax"
+    return None
+
+
+def _collect_treesitter_syntax_errors(
+    root_node: Any, source_lines: List[str], limit: int = 5
+) -> List[str]:
+    """Walk a Tree-sitter AST and return concise 1-based line diagnostics for ERROR/MISSING nodes."""
+    errors: List[str] = []
+    seen_lines: Set[int] = set()
+    stack = [root_node]
+
+    while stack and len(errors) < limit:
+        node = stack.pop()
+        is_err = getattr(node, "type", "") == "ERROR"
+        is_missing = bool(getattr(node, "is_missing", False))
+        if is_err or is_missing:
+            line_no = node.start_point[0] + 1
+            if line_no not in seen_lines:
+                seen_lines.add(line_no)
+                snippet = (
+                    source_lines[line_no - 1].strip()[:90]
+                    if 0 <= line_no - 1 < len(source_lines)
+                    else ""
+                )
+                kind = f"missing `{node.type}`" if is_missing else "syntax error"
+                errors.append(
+                    f"line {line_no}: {kind}"
+                    + (f" near `{snippet}`" if snippet else "")
+                )
+            continue
+        if getattr(node, "has_error", False):
+            children = getattr(node, "children", ()) or ()
+            for child in reversed(children):
+                if getattr(child, "has_error", False) or getattr(child, "is_missing", False):
+                    stack.append(child)
+
+    return errors
+
+
+def validate_java_syntax(
+    file_path: str,
+    original: str,
+    patched: str,
+    parser: Any = None,
+) -> Optional[str]:
+    """Catch Java syntax errors & EOF truncation before writing a patch to disk."""
+    if not file_path.endswith(".java") or not patched or not patched.strip():
+        return None
+
+    # 1. Fast comment/string-aware delimiter & EOF truncation check
+    patched_balance_err = _check_java_delimiter_balance(patched)
+    if patched_balance_err is not None:
+        orig_balance_err = _check_java_delimiter_balance(original)
+        if orig_balance_err is None:
+            return f"Java syntax check failed: {patched_balance_err}."
+
+    # 2. Full Tree-sitter Java AST parse check (thread-safe via lock)
+    if parser is not None and hasattr(parser, "parse"):
+        with _SYNTAX_PARSE_LOCK:
+            patched_tree = parser.parse(patched.encode("utf-8"))
+            patched_has_error = bool(getattr(patched_tree.root_node, "has_error", False))
+            if patched_has_error:
+                orig_tree = parser.parse(original.encode("utf-8"))
+                orig_has_error = bool(getattr(orig_tree.root_node, "has_error", False))
+                if not orig_has_error:
+                    details = _collect_treesitter_syntax_errors(
+                        patched_tree.root_node, patched.splitlines()
+                    )
+                    summary = "; ".join(details) if details else "malformed Java syntax / unexpected EOF"
+                    return (
+                        f"Java syntax check failed before compilation ({summary}). "
+                        "Fix every missing semicolon, parenthesis, brace, and truncated method."
+                    )
+
     return None
 
 

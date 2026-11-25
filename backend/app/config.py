@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
 
@@ -8,6 +9,10 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # directory the app/tests are launched from. config.py lives at
 # backend/app/config.py, so parents[1] is the backend root.
 BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+_DEFAULT_NVIDIA_MODEL = "mistralai/mistral-large-2-instruct"
+_DEFAULT_OPENROUTER_MODEL = "openai/gpt-oss-120b"
 
 
 class Settings(BaseSettings):
@@ -68,17 +73,25 @@ class Settings(BaseSettings):
 
     # Swap providers here
     llm_provider: str = "gemini"
+    # Optional explicit model override regardless of provider (CODEREVIVE_LLM_MODEL)
+    llm_model: str = ""
+    # Max concurrent LLM file-repair calls within an independent dependency wave
+    llm_max_concurrency: int = 4
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = _DEFAULT_GEMINI_MODEL
 
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = "mistralai/mistral-large-2-instruct"
+    nvidia_model: str = _DEFAULT_NVIDIA_MODEL
+    nvidia_max_tokens: int = 32768
+    nvidia_timeout_seconds: float = 300.0
+    nvidia_stream: bool = True
+    nvidia_enable_thinking: bool = False
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_model: str = "openai/gpt-oss-120b"
+    openrouter_model: str = _DEFAULT_OPENROUTER_MODEL
     openrouter_reasoning_enabled: bool = True
     openrouter_reasoning_effort: Optional[str] = None
     openrouter_site_url: str = ""
@@ -173,6 +186,84 @@ class Settings(BaseSettings):
                 return json.loads(stripped)
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return value
+
+    def resolve_llm_provider(self) -> str:
+        """Resolve the active LLM provider from live environment variables or settings."""
+        raw = (
+            os.environ.get("CODEREVIVE_LLM_PROVIDER")
+            or os.environ.get("LLM_PROVIDER")
+            or self.llm_provider
+            or "gemini"
+        )
+        return raw.strip().lower() or "gemini"
+
+    def resolve_llm_model(self, provider: Optional[str] = None) -> str:
+        """Resolve the active LLM model name from environment variables or settings."""
+        resolved_provider = (
+            provider.strip().lower() if provider else self.resolve_llm_provider()
+        )
+        explicit_generic = (
+            os.environ.get("CODEREVIVE_LLM_MODEL")
+            or os.environ.get("LLM_MODEL")
+            or self.llm_model
+            or ""
+        ).strip()
+        if explicit_generic:
+            return explicit_generic
+
+        provider_env_keys = {
+            "gemini": ("CODEREVIVE_GEMINI_MODEL", "GEMINI_MODEL"),
+            "nvidia": ("CODEREVIVE_NVIDIA_MODEL", "NVIDIA_MODEL"),
+            "openrouter": ("CODEREVIVE_OPENROUTER_MODEL", "OPENROUTER_MODEL"),
+        }
+        for key in provider_env_keys.get(resolved_provider, ()):
+            val = (os.environ.get(key) or "").strip()
+            if val:
+                return val
+
+        model_by_provider = {
+            "gemini": self.gemini_model,
+            "nvidia": self.nvidia_model,
+            "openrouter": self.openrouter_model,
+        }
+        resolved = (model_by_provider.get(resolved_provider) or "").strip()
+        return resolved or resolved_provider
+
+    def has_explicit_llm_model_config(self, provider: Optional[str] = None) -> bool:
+        """Return True if an explicit model was configured via env or .env."""
+        resolved_provider = (
+            provider.strip().lower() if provider else self.resolve_llm_provider()
+        )
+        if (
+            (os.environ.get("CODEREVIVE_LLM_MODEL") or "").strip()
+            or (os.environ.get("LLM_MODEL") or "").strip()
+            or (self.llm_model or "").strip()
+        ):
+            return True
+
+        env_checks = {
+            "gemini": (
+                ("CODEREVIVE_GEMINI_MODEL", "GEMINI_MODEL"),
+                self.gemini_model,
+                _DEFAULT_GEMINI_MODEL,
+            ),
+            "nvidia": (
+                ("CODEREVIVE_NVIDIA_MODEL", "NVIDIA_MODEL"),
+                self.nvidia_model,
+                _DEFAULT_NVIDIA_MODEL,
+            ),
+            "openrouter": (
+                ("CODEREVIVE_OPENROUTER_MODEL", "OPENROUTER_MODEL"),
+                self.openrouter_model,
+                _DEFAULT_OPENROUTER_MODEL,
+            ),
+        }
+        if resolved_provider not in env_checks:
+            return False
+        keys, current_val, default_val = env_checks[resolved_provider]
+        if any((os.environ.get(k) or "").strip() for k in keys):
+            return True
+        return (current_val or "").strip() not in ("", default_val)
 
     @property
     def resolved_workspace_root(self) -> Path:

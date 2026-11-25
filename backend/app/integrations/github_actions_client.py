@@ -348,13 +348,8 @@ class GitHubActionsClient:
 
     def download_artifact(self, artifact_id: int, *, follow_redirects: bool = True) -> bytes:
         """Download a workflow run artifact as raw bytes (zip archive)."""
-        data = self._request(
-            "GET",
-            f"/actions/artifacts/{artifact_id}/zip",
-        )
-        # The artifacts/{id}/zip endpoint issues a redirect to the media download
-        # URL. httpx follows redirects by default, but `_request` parses JSON which
-        # will fail on a binary zip. Perform the raw request here instead.
+        # The artifacts/{id}/zip endpoint issues a redirect to the binary zip
+        # archive, so use _download_raw directly rather than JSON parsing.
         return self._download_raw(artifact_id, follow_redirects=follow_redirects)
 
     def _download_raw(self, artifact_id: int, *, follow_redirects: bool) -> bytes:
@@ -383,6 +378,15 @@ class GitHubActionsClient:
             if artifact.name == name:
                 return artifact
         return None
+
+    def get_repo_variable(self, name: str) -> Optional[str]:
+        """Best-effort fetch of a GitHub Actions repository variable value."""
+        try:
+            data = self._request("GET", f"/actions/variables/{name}")
+        except GitHubActionsError:
+            return None
+        value = data.get("value")
+        return str(value).strip() if isinstance(value, str) and value.strip() else None
 
     def close(self) -> None:
         self._client.close()

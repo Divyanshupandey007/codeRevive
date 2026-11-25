@@ -1,4 +1,15 @@
-import { Component, DestroyRef, ElementRef, computed, effect, inject, signal, viewChild } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  DestroyRef,
+  ElementRef,
+  computed,
+  effect,
+  inject,
+  signal,
+  viewChild
+} from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { DatePipe } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
@@ -16,14 +27,15 @@ const STEPS = ['Init', 'Pass 1 (OpenRewrite)', 'Sandbox Verify', 'AI Repair', 'I
   selector: 'app-pipeline-monitor',
   imports: [RouterLink, DatePipe],
   templateUrl: './pipeline-monitor.html',
-  styleUrl: './pipeline-monitor.scss'
+  styleUrl: './pipeline-monitor.scss',
+  changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class PipelineMonitor {
   private readonly api = inject(CodeReviveService);
   private readonly route = inject(ActivatedRoute);
   private readonly destroyRef = inject(DestroyRef);
 
-  readonly jobId = this.route.snapshot.paramMap.get('id') ?? '';
+  readonly jobId = signal<string>('');
   readonly steps = STEPS;
 
   readonly job = signal<MigrationJobRecord | null>(null);
@@ -34,34 +46,14 @@ export class PipelineMonitor {
 
   private readonly consoleRef = viewChild<ElementRef<HTMLDivElement>>('console');
 
-  private readonly pollIntervalMs = 3_000; // was 1_000: two endpoints per tick, so this cuts polling traffic ~3x
+  private readonly pollIntervalMs = 2_500;
 
   readonly logLines = computed(() => this.events().map(eventToLogLine));
-
-  /** Console lines annotated with whether a minimal loader should follow them.
-   * A loader appears after the last line while the job is still running, or
-   * after any line when the gap to the next line exceeds the load threshold. */
-  readonly LOAD_GAP_MS = 1000;
-
-  readonly consoleLines = computed(() => {
-    const events = this.events();
-    const job = this.job();
-    const isRunning = job?.status === 'RUNNING';
-    const now = this.now();
-    return events.map((event, index) => {
-      const line = eventToLogLine(event);
-      let showLoader = false;
-      if (index === events.length - 1 && isRunning) {
-        const t = Date.parse(event.timestamp);
-        if (!Number.isNaN(t) && now - t > this.LOAD_GAP_MS) {
-          // Last printed line and no new activity for over a second while still running:
-          // show a minimal loader so the job does not look stuck.
-          showLoader = true;
-        }
-      }
-      return { line, showLoader };
-    });
+  readonly isActiveJob = computed(() => {
+    const status = this.job()?.status;
+    return status === 'QUEUED' || status === 'RUNNING';
   });
+  readonly showWorkingLoader = computed(() => this.isActiveJob());
   readonly failed = computed(() => this.job()?.status === 'FAILED');
   readonly completed = computed(() => this.job()?.status === 'COMPLETED');
 
@@ -79,16 +71,20 @@ export class PipelineMonitor {
   });
 
   readonly stageHint = computed(() => {
-    if (this.job()?.status !== 'RUNNING') {
+    if (!this.isActiveJob()) {
       return '';
     }
     switch (this.activeStep()) {
+      case 0:
+        return 'Preparing migration workspace and checking out repository…';
       case 1:
         return 'OpenRewrite is running. Large repositories can take several minutes.';
       case 2:
         return 'Maven verification is running in Docker. This can take several minutes.';
       case 3:
         return 'AI repair is in progress. The sandbox will verify each repaired build.';
+      case 4:
+        return 'Running post-migration integrity verification…';
       default:
         return '';
     }
@@ -116,16 +112,29 @@ export class PipelineMonitor {
   });
 
   constructor() {
-    if (this.jobId) {
-      this.poll();
-      // Keeps the "Working…" loader animation smooth between API polls.
+    this.route.paramMap.pipe(takeUntilDestroyed(this.destroyRef)).subscribe((params) => {
+      const id = params.get('id') ?? '';
+      this.jobId.set(id);
+      this.job.set(null);
+      this.events.set([]);
+      this.loadError.set(null);
+      this.cancelling.set(false);
+      this.now.set(Date.now());
+      if (id) {
+        this.api.setActiveJobId(id);
+        this.poll(id);
+      }
+    });
+
+    if (typeof window !== 'undefined') {
       const nowTimer = setInterval(() => this.now.set(Date.now()), 1_000);
       const pollTimer = setInterval(() => {
+        const id = this.jobId();
         const status = this.job()?.status;
-        if (this.loadError() || status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') {
+        if (!id || this.loadError() || status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED') {
           return;
         }
-        this.poll();
+        this.poll(id);
       }, this.pollIntervalMs);
       this.destroyRef.onDestroy(() => {
         clearInterval(nowTimer);
@@ -135,14 +144,15 @@ export class PipelineMonitor {
 
     // Auto-scroll the console when already near the bottom.
     effect(() => {
-      const lines = this.logLines();
-      if (lines.length > 0) {
+      const count = this.logLines().length;
+      const working = this.showWorkingLoader();
+      if (count > 0 || working) {
         queueMicrotask(() => {
           const el = this.consoleRef()?.nativeElement;
           if (!el) {
             return;
           }
-          const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+          const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
           if (nearBottom) {
             el.scrollTop = el.scrollHeight;
           }
@@ -151,54 +161,64 @@ export class PipelineMonitor {
     });
   }
 
-  private poll(): void {
-    if (!this.jobId) {
+  private poll(id: string): void {
+    if (!id) {
       return;
     }
     this.api
-      .getJob(this.jobId)
+      .getJob(id)
       .pipe(
         catchError((error: HttpErrorResponse) => {
+          if (this.jobId() !== id) {
+            return of(null);
+          }
           if (error.status === 404) {
-            this.loadError.set(`Job '${this.jobId}' was not found. It may have been deleted.`);
+            this.loadError.set(`Job '${id}' was not found. It may have been cleaned up or deleted.`);
           }
           return of(null);
         })
       )
       .subscribe((job) => {
-        if (job) {
+        if (job && this.jobId() === id) {
           this.loadError.set(null);
           this.job.set(job);
         }
       });
     this.api
-      .getJobEvents(this.jobId)
+      .getJobEvents(id)
       .pipe(catchError(() => of(null)))
       .subscribe((res) => {
-        if (res) {
+        if (res && this.jobId() === id) {
           this.events.set(res.events);
         }
       });
   }
 
-  refresh(): void {
+  retryLoad(): void {
+    const id = this.jobId();
+    if (!id) {
+      return;
+    }
     this.loadError.set(null);
-    this.poll();
+    this.poll(id);
   }
 
   cancel(): void {
-    if (!this.jobId || this.cancelling()) {
+    const id = this.jobId();
+    if (!id || this.cancelling()) {
       return;
     }
     this.cancelling.set(true);
-    this.api.cancelJob(this.jobId).subscribe({
+    this.api.cancelJob(id).subscribe({
       next: () => {
         this.cancelling.set(false);
-        this.poll();
+        if (this.jobId() === id) {
+          this.poll(id);
+        }
       },
       error: () => {
         this.cancelling.set(false);
-      },
+      }
     });
   }
 

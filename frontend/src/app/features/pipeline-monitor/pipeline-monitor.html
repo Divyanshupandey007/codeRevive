@@ -1,5 +1,5 @@
 <section class="monitor">
-  @if (!jobId) {
+  @if (!jobId()) {
     <div class="panel empty-state">
       <span class="empty-state-icon" aria-hidden="true">◎</span>
       <h1>No Active Migration</h1>
@@ -23,14 +23,8 @@
           [class.badge-blue]="j.status === 'QUEUED'"
           >{{ j.status }}</span
         >
-        <button class="btn btn-ghost btn-sm" (click)="refresh()">Refresh</button>
-        @if (j.gha_run_url) {
-          <a class="btn btn-ghost btn-sm" [href]="j.gha_run_url" target="_blank" rel="noopener">
-            View on GitHub ↗
-          </a>
-        }
         @if (j.status === 'QUEUED' || j.status === 'RUNNING') {
-          <button class="btn btn-danger btn-sm" (click)="cancel()" [disabled]="cancelling()">
+          <button type="button" class="btn btn-danger btn-sm" (click)="cancel()" [disabled]="cancelling()">
             {{ cancelling() ? 'Cancelling…' : 'Cancel migration' }}
           </button>
         }
@@ -103,21 +97,20 @@
         <span class="dim">{{ logLines().length }} events</span>
       </div>
       <div class="console-body mono" #console>
-        @for (entry of consoleLines(); track $index) {
+        @for (line of logLines(); track $index) {
           <div class="log-line">
-            <span class="log-ts">{{ entry.line.timestamp | date: 'HH:mm:ss' }}</span>
-            <span class="log-tag" [class]="'log-tag ' + entry.line.tagClass">[{{ entry.line.tag }}]</span>
-            <span class="log-msg">{{ entry.line.message }}</span>
+            <span class="log-ts">{{ line.timestamp | date: 'HH:mm:ss' }}</span>
+            <span class="log-tag" [class]="'log-tag ' + line.tagClass">[{{ line.tag }}]</span>
+            <span class="log-msg">{{ line.message }}</span>
           </div>
-          @if (entry.showLoader) {
-            <div class="log-line log-loading">
-              <span class="spinner" aria-hidden="true"></span>
-              <span class="log-msg dim mono">Working…</span>
-            </div>
-          }
         }
-        @if (consoleLines().length === 0) {
-          <div class="log-line dim">Waiting for events…</div>
+        @if (showWorkingLoader()) {
+          <div class="log-line log-loading">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="log-msg dim mono">Working…</span>
+          </div>
+        } @else if (logLines().length === 0) {
+          <div class="log-line dim">No events recorded yet.</div>
         }
       </div>
     </div>
@@ -126,10 +119,13 @@
       <span class="badge badge-red">NOT FOUND</span>
       <span class="mono">{{ loadError() }}</span>
       <span class="spacer"></span>
-      <button class="btn btn-ghost btn-sm" (click)="refresh()">Retry</button>
+      <button type="button" class="btn btn-ghost btn-sm" (click)="retryLoad()">Retry</button>
       <a class="btn btn-ghost btn-sm" routerLink="/launcher">← Launcher</a>
     </div>
   } @else {
-    <div class="panel loading dim">Loading job <span class="mono">{{ jobId }}</span>…</div>
+    <div class="panel loading dim">
+      <span class="spinner" aria-hidden="true"></span>
+      <span>Loading job <span class="mono">{{ jobId() }}</span>…</span>
+    </div>
   }
 </section>

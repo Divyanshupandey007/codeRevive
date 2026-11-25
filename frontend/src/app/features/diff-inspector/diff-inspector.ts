@@ -1,4 +1,4 @@
-import { Component, computed, effect, input, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, effect, input, signal } from '@angular/core';
 
 import { FileMigrationStatus } from '../../core/models/api.models';
 import { ParsedFileDiff, parseFileDiff, toSideBySide } from '../../core/utils/diff.util';
@@ -13,7 +13,8 @@ import { ParsedFileDiff, parseFileDiff, toSideBySide } from '../../core/utils/di
   selector: 'app-diff-inspector',
   imports: [],
   templateUrl: './diff-inspector.html',
-  styleUrl: './diff-inspector.scss'
+  styleUrl: './diff-inspector.scss',
+  changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class DiffInspector {
   readonly files = input.required<FileMigrationStatus[]>();
@@ -62,7 +63,7 @@ export class DiffInspector {
 
   copyPatch(): void {
     const sel = this.selected();
-    if (!sel) {
+    if (!sel || typeof navigator === 'undefined' || !navigator.clipboard) {
       return;
     }
     navigator.clipboard.writeText(sel.raw).then(

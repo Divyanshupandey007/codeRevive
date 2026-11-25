@@ -10,7 +10,7 @@ class LLMFactory:
     @staticmethod
     def create(provider: Optional[str] = None) -> LLMProvider:
         resolved = (
-            provider if provider is not None else settings.llm_provider
+            provider if provider is not None else settings.resolve_llm_provider()
         ).strip().lower()
 
         if resolved == "gemini":
