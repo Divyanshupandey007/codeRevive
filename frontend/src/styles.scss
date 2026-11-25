@@ -170,6 +170,12 @@ a:hover {
 }
 
 /* ---------- Chips ---------- */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
 .chip {
   display: inline-flex;
   align-items: center;

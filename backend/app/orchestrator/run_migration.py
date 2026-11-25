@@ -19,33 +19,39 @@ from app.orchestrator.workflow import MigrationOrchestrator
 from app.sandbox.docker_runner import ContainerExecutionError
 
 
+def _normalize_progress_callback_base(base_url: str) -> str:
+    cleaned = base_url.strip().rstrip("/")
+    if not cleaned:
+        return ""
+    if "/internal/github-actions/runs" in cleaned:
+        return cleaned
+    if cleaned.endswith("/api"):
+        return f"{cleaned}/internal/github-actions/runs"
+    return f"{cleaned}/api/internal/github-actions/runs"
+
+
 def _build_progress_publisher() -> Optional[Callable[[str], None]]:
     """Build a progress_callback that relays each internal stage transition
     back to the backend's live Pipeline Monitor.
 
-    When this CLI runs inside the GitHub Actions workflow, the backend has no
-    way to see *inside* the single "Run CodeRevive migration" step other than
-    this relay (GitHub only exposes whole-step status, and only returns a
-    step's logs once it has finished). Each transition is POSTed to
-    POST /api/internal/github-actions/runs/{run_id}/events, which
-    MigrationJobManager.append_remote_event appends to the same job record
-    the Angular Pipeline Monitor already polls.
-
     Returns None (callback disabled) unless CODEREVIVE_PROGRESS_CALLBACK_URL,
-    CODEREVIVE_PROGRESS_CALLBACK_TOKEN and GITHUB_RUN_ID (set automatically by
-    Actions) are all present, so this is a no-op for local runs.
+    CODEREVIVE_PROGRESS_CALLBACK_TOKEN and GITHUB_RUN_ID are all present, so
+    this is a no-op for local runs.
     """
-    base_url = settings.progress_callback_url
-    token = settings.progress_callback_token
-    run_id = os.environ.get("GITHUB_RUN_ID")
+    base_url = _normalize_progress_callback_base(
+        settings.progress_callback_url or os.environ.get("CODEREVIVE_PROGRESS_CALLBACK_URL", "")
+    )
+    token = (
+        settings.progress_callback_token
+        or os.environ.get("CODEREVIVE_PROGRESS_CALLBACK_TOKEN", "")
+    ).strip()
+    run_id = (os.environ.get("GITHUB_RUN_ID") or "").strip()
     if not (base_url and token and run_id):
         return None
 
-    endpoint = f"{base_url.rstrip('/')}/{run_id}/events"
+    endpoint = f"{base_url}/{run_id}/events"
 
     def publish(event_text: str) -> None:
-        # Print locally first: the GitHub Actions console log must keep
-        # working even if the relay call below fails or times out.
         print(event_text, flush=True)
         stage = event_text.split(":", 1)[0] if ":" in event_text else event_text
         try:
@@ -56,9 +62,6 @@ def _build_progress_publisher() -> Optional[Callable[[str], None]]:
                 timeout=5.0,
             )
         except httpx.HTTPError as exc:
-            # Best-effort: a dropped progress update must never fail the
-            # migration itself. The backend's own poll loop still provides a
-            # coarse fallback if every relay call fails.
             print(f"[PROGRESS_RELAY_WARNING] {exc}", flush=True)
 
     return publish
@@ -158,6 +161,8 @@ def main() -> int:
         ).run(request.repo_url, clean=request.clean)
     except UnsupportedRepositoryError as exc:
         print(f"\nRepository not supported: {exc}")
+        if publish_progress:
+            publish_progress(f"failed:Repository not supported: {exc}")
         return 1
 
     repo_path = Path(ingestion_report.repo_info.target_path)
@@ -192,9 +197,13 @@ def main() -> int:
         print(
             "Set CODEREVIVE_LLM_PROVIDER and the matching API key in backend/.env (see .env.example)."
         )
+        if publish_progress:
+            publish_progress(f"failed:Could not set up the LLM provider: {exc}")
         return 1
     except (LLMProviderError, ContainerExecutionError) as exc:
         print(f"\nMigration run aborted: {exc}")
+        if publish_progress:
+            publish_progress(f"failed:{exc}")
         return 1
 
     print("\n[3/3] Writing the audit report ...")

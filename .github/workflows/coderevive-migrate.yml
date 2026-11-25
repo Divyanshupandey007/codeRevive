@@ -31,6 +31,10 @@ on:
         description: "LLM provider: gemini, nvidia, or openrouter"
         required: true
         default: "gemini"
+      llm_model:
+        description: "Optional explicit LLM model override"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -50,8 +54,11 @@ jobs:
       CODEREVIVE_MIGRATION_BRANCH_NAME: ${{ inputs.branch }}
       CODEREVIVE_OPENREWRITE_MODE: ${{ inputs.openrewrite_mode }}
       CODEREVIVE_DEFAULT_RETRY_BUDGET: ${{ inputs.retry_budget }}
-      CODEREVIVE_LLM_PROVIDER: ${{ inputs.llm_provider }}
-      CODEREVIVE_GEMINI_MODEL: ${{ vars.CODEREVIVE_GEMINI_MODEL || 'gemini-3.1-flash-lite' }}
+      CODEREVIVE_LLM_PROVIDER: ${{ inputs.llm_provider || vars.CODEREVIVE_LLM_PROVIDER || 'gemini' }}
+      CODEREVIVE_LLM_MODEL: ${{ inputs.llm_model || vars.CODEREVIVE_LLM_MODEL || '' }}
+      CODEREVIVE_GEMINI_MODEL: ${{ vars.CODEREVIVE_GEMINI_MODEL || 'gemini-2.5-flash' }}
+      CODEREVIVE_NVIDIA_MODEL: ${{ vars.CODEREVIVE_NVIDIA_MODEL || '' }}
+      CODEREVIVE_OPENROUTER_MODEL: ${{ vars.CODEREVIVE_OPENROUTER_MODEL || '' }}
       # LLM API keys are provided by GitHub Secrets and never reach the frontend.
       CODEREVIVE_GEMINI_API_KEY: ${{ secrets.CODEREVIVE_GEMINI_API_KEY }}
       CODEREVIVE_NVIDIA_API_KEY: ${{ secrets.CODEREVIVE_NVIDIA_API_KEY }}

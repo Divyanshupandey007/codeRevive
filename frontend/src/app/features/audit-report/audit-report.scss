@@ -65,6 +65,10 @@
 .commit-link {
   color: var(--blue);
   cursor: pointer;
+  background: transparent;
+  border: none;
+  padding: 0;
+  text-align: left;
 }
 .commit-link:hover {
   text-decoration: underline;
