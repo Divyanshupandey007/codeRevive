@@ -220,7 +220,7 @@ class GitHubActionsClient:
         ``workflow_run_id`` directly, so we no longer need to guess which run
         was created by listing recent runs.
         """
-        payload: Dict[str, Any] = {"ref": ref, "inputs": inputs}
+        payload: Dict[str, Any] = {"ref": ref, "inputs": inputs, "return_run_details": True}
         data = self._request(
             "POST",
             f"/actions/workflows/{self._workflow_id}/dispatches",

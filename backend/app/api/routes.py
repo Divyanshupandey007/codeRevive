@@ -354,7 +354,7 @@ def build_api_router() -> APIRouter:
         summary="List migration jobs and latest report availability",
     )
     def list_migrations_route(
-        job_status: Optional[Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED"]] = Query(
+        job_status: Optional[Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]] = Query(
             default=None, alias="status"
         ),
         limit: int = Query(default=50, ge=1, le=200),
@@ -446,7 +446,7 @@ def build_api_router() -> APIRouter:
         summary="List asynchronous migration jobs",
     )
     def list_jobs_route(
-        job_status: Optional[Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED"]] = Query(
+        job_status: Optional[Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]] = Query(
             default=None, alias="status"
         ),
         limit: int = Query(default=50, ge=1, le=200),
