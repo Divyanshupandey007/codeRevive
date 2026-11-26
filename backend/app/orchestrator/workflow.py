@@ -62,9 +62,12 @@ from app.orchestrator.java_patch_utils import (
 )
 from app.orchestrator.repair_heuristics import (
     app_candidate_priority,
+    detect_missing_pom_dependencies,
     extract_implicated_bean_stems,
     extract_runtime_log_excerpt,
+    is_dependency_classpath_runtime_failure,
     is_pure_cascading_override_failure,
+    java_errors_only_missing_packages,
     looks_like_app_runtime_failure,
     resolve_sandbox_db_fallback_args,
 )
@@ -793,6 +796,7 @@ class MigrationOrchestrator:
         round_number = 0
         repaired_test_files: Set[str] = set()
         runtime_repaired_app_files: Set[str] = set()
+        surfaced_missing_dep_coords: Set[str] = set()
         active_maven_args: Optional[List[str]] = (
             list(self.maven_args) if self.maven_args is not None else None
         )
@@ -847,6 +851,7 @@ class MigrationOrchestrator:
                         initial_maven_args=self.maven_args,
                         current_maven_args=active_maven_args,
                         tried_fallbacks=tried_db_fallbacks,
+                        raw_logs=build_result.raw_logs,
                     )
                     if fallback is not None:
                         key, reason, next_args = fallback
@@ -929,6 +934,69 @@ class MigrationOrchestrator:
                         f" [DISCOVERED] surfaced {surfaced_count} unattempted planned target(s) "
                         f"(javac reported {len(build_result.compiler_errors)} errors)"
                     )
+
+            # If javac reports missing Jakarta / Spring Boot 3 packages (e.g. `package jakarta.validation.constraints
+            # does not exist` because a transitive Boot 2 annotation was replaced without the Boot 3 starter in pom.xml),
+            # surface pom.xml first and avoid fruitless no-op retries on already-migrated Java files.
+            if build_result.compiler_errors and (self.repo_path / "pom.xml").is_file():
+                missing_pom_deps = [
+                    item
+                    for item in detect_missing_pom_dependencies(build_result.compiler_errors)
+                    if item[1] not in surfaced_missing_dep_coords
+                ]
+                if missing_pom_deps:
+                    pom_rec = self._ensure_work_item(
+                        "pom.xml",
+                        file_records,
+                        target_file_paths,
+                        identifier_to_file,
+                        plan,
+                        graph_targets_by_path,
+                        is_test=False,
+                    )
+                    if pom_rec is not None and pom_rec.state not in (
+                        FileStatus.SKIPPED,
+                        FileStatus.REJECTED,
+                    ):
+                        pom_existing_errs, pom_existing_tests = actionable.get(
+                            "pom.xml", ([], [])
+                        )
+                        pom_errs = list(pom_existing_errs)
+                        missing_pkgs: Set[str] = set()
+                        for pkg, coord, reason in missing_pom_deps:
+                            surfaced_missing_dep_coords.add(coord)
+                            missing_pkgs.add(pkg)
+                            pom_errs.append(
+                                CompilerError(
+                                    file_path="pom.xml",
+                                    line_number=None,
+                                    column=None,
+                                    message=(
+                                        f"Java compilation failed with 'package {pkg} does not exist'; "
+                                        f"add dependency {coord} to pom.xml ({reason})."
+                                    ),
+                                )
+                            )
+                        actionable["pom.xml"] = (pom_errs, list(pom_existing_tests))
+                        deferred_java = [
+                            fp
+                            for fp, (errs, tests) in list(actionable.items())
+                            if fp != "pom.xml"
+                            and fp.endswith(".java")
+                            and not tests
+                            and java_errors_only_missing_packages(errs, missing_pkgs)
+                        ]
+                        for fp in deferred_java:
+                            del actionable[fp]
+                        print(
+                            f" [MISSING DEPENDENCY] Surfaced pom.xml for missing package(s): "
+                            f"{', '.join(sorted(missing_pkgs))}"
+                            + (
+                                f" (deferred {len(deferred_java)} Java file(s) pending pom.xml update)"
+                                if deferred_java
+                                else ""
+                            )
+                        )
 
             # If Pass 1 did not upgrade pom.xml (e.g. --no-openrewrite or maven_only failure)
             # and sandbox build failed with unattributed build/POM diagnostics, repair pom.xml first.
@@ -1049,7 +1117,31 @@ class MigrationOrchestrator:
                             )
                         )
                     ]
-                    if prioritized_implicated:
+                    dep_classpath_failure = is_dependency_classpath_runtime_failure(
+                        build_result.failed_tests, build_result.raw_logs
+                    )
+                    if (
+                        dep_classpath_failure
+                        and (self.repo_path / "pom.xml").is_file()
+                        and "pom.xml" not in runtime_repaired_app_files
+                    ):
+                        pom_rec = self._ensure_work_item(
+                            "pom.xml",
+                            file_records,
+                            target_file_paths,
+                            identifier_to_file,
+                            plan,
+                            graph_targets_by_path,
+                            is_test=False,
+                        )
+                        if pom_rec is not None and pom_rec.state not in (
+                            FileStatus.SKIPPED,
+                            FileStatus.REJECTED,
+                        ):
+                            chosen = ["pom.xml"]
+                        else:
+                            chosen = []
+                    elif prioritized_implicated:
                         chosen = prioritized_implicated[:2]
                     elif unmigrated_or_llm:
                         chosen = unmigrated_or_llm[:2]
@@ -1068,12 +1160,21 @@ class MigrationOrchestrator:
                         runtime_log_excerpt = extract_runtime_log_excerpt(
                             build_result.raw_logs
                         )
-                        repair_context = (
-                            "Integration/runtime test(s) or Spring ApplicationContext startup failed "
-                            "during verification. Do NOT expect the test assertions to change; "
-                            "inspect this application file for Spring Boot 3 / Spring Security 6 / "
-                            "bean wiring / Thymeleaf / configuration compatibility bugs causing the failures."
-                        )
+                        if dep_classpath_failure and chosen == ["pom.xml"]:
+                            repair_context = (
+                                "Spring ApplicationContext startup or test runtime failed with a "
+                                "dependency/classpath compatibility error (such as NoClassDefFoundError "
+                                "for javax.*, outdated SpringDoc 1.x, MyBatis-Plus Boot 2 starter, "
+                                "Mockito 4 mockito-inline, or mismatched Boot 2 artifact). Inspect pom.xml "
+                                "and upgrade or remove the incompatible Spring Boot 2 dependency."
+                            )
+                        else:
+                            repair_context = (
+                                "Integration/runtime test(s) or Spring ApplicationContext startup failed "
+                                "during verification. Do NOT expect the test assertions to change; "
+                                "inspect this application file for Spring Boot 3 / Spring Security 6 / "
+                                "bean wiring / Thymeleaf / configuration compatibility bugs causing the failures."
+                            )
                     elif already_tried_test:
                         actionable = {}
 

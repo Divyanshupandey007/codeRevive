@@ -8,6 +8,10 @@ import uuid
 
 from app.config import settings
 from app.models.execution import BuildResult
+from app.orchestrator.repair_heuristics import (
+    detect_jooq_codegen_skip_defines,
+    insert_maven_defines,
+)
 from app.sandbox.diagnostics_parser import parse_maven_output
 from app.sandbox.service_detector import ServiceRequirement, detect_required_services
 from app.sandbox.service_manager import (
@@ -316,12 +320,24 @@ class DockerRunner:
             raise ContainerExecutionError(f"repo_path does not exist; {repo_path}")
 
         maven_args = (
-            settings.sandbox_default_maven_args if maven_args is None else maven_args
+            list(settings.sandbox_default_maven_args)
+            if maven_args is None
+            else list(maven_args)
         )
 
+        jooq_skip_defines = detect_jooq_codegen_skip_defines(
+            repo_path, require_existing_sources=True
+        )
+        missing_jooq_defines = [d for d in jooq_skip_defines if d not in maven_args]
+        if missing_jooq_defines:
+            maven_args = insert_maven_defines(maven_args, missing_jooq_defines)
+            print(
+                f" [SANDBOX] Pre-generated jOOQ sources detected; passing {' '.join(missing_jooq_defines)} "
+                "so jooq-codegen-maven does not overwrite them or require a pre-migrated DB during generate-sources."
+            )
+
         using_embedded_override = any(
-            arg.startswith("-Dspring.profiles.active=test")
-            or arg.startswith("-Dspring.datasource.url=jdbc:h2:")
+            arg.startswith("-Dspring.datasource.url=jdbc:h2:")
             for arg in maven_args
         )
         active_services: List[ServiceRequirement] = []

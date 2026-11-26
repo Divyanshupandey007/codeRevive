@@ -56,6 +56,23 @@ export class PipelineMonitor {
   readonly showWorkingLoader = computed(() => this.isActiveJob());
   readonly failed = computed(() => this.job()?.status === 'FAILED');
   readonly completed = computed(() => this.job()?.status === 'COMPLETED');
+  readonly hasAuditReport = computed(() => {
+    const j = this.job();
+    return Boolean(j && (j.status === 'COMPLETED' || j.summary));
+  });
+  readonly errorBadgeLabel = computed(() => {
+    const errorType = (this.job()?.error_type ?? '').toLowerCase();
+    if (errorType.includes('integrity') || errorType.includes('guardrail')) {
+      return 'GUARDRAIL';
+    }
+    if (errorType.includes('environment')) {
+      return 'ENV FAILURE';
+    }
+    if (errorType.includes('unsupported')) {
+      return 'UNSUPPORTED';
+    }
+    return 'ERROR';
+  });
 
   readonly failedStep = computed(() => {
     const job = this.job();

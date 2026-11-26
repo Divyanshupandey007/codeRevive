@@ -48,5 +48,12 @@ export function failedStepForJob(job: JobProgress): number {
   }
 
   const previousEvent = [...job.events].reverse().find((event) => event.stage !== 'failed');
-  return previousEvent ? activeStepForJob({ ...job, stage: previousEvent.stage }) : 0;
+  const prevStep = previousEvent ? activeStepForJob({ ...job, stage: previousEvent.stage }) : 0;
+  if (
+    prevStep === 2 &&
+    job.events.some((event) => /repair|generating_patch|llm/i.test(event.stage))
+  ) {
+    return 3;
+  }
+  return prevStep;
 }

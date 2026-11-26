@@ -28,7 +28,7 @@
             {{ cancelling() ? 'Cancelling…' : 'Cancel migration' }}
           </button>
         }
-        @if (j.status === 'COMPLETED') {
+        @if (hasAuditReport()) {
           <a class="btn btn-primary" [routerLink]="['/reports', j.job_id]">View Audit Report</a>
         } @else {
           <span class="btn btn-primary btn-disabled" aria-disabled="true">View Audit Report</span>
@@ -86,7 +86,7 @@
 
     @if (j.error) {
       <div class="panel error-banner" role="alert">
-        <span class="badge badge-red">ERROR</span>
+        <span class="badge badge-red">{{ errorBadgeLabel() }}</span>
         <span class="mono">{{ j.error }}</span>
       </div>
     }

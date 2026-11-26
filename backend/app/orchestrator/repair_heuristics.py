@@ -34,12 +34,116 @@ _APP_RUNTIME_FAILURE_HINTS = (
     "could not autowire",
 )
 
-_TEST_API_FAILURE_HINTS = (
+_TEST_HARNESS_FAILURE_HINTS = (
+    "webdriverexception",
+    "sessionnotcreatedexception",
+)
+
+_CLASSPATH_FAILURE_HINTS = (
     "nosuchmethoderror",
     "noclassdeffounderror",
     "classnotfoundexception",
-    "webdriverexception",
-    "sessionnotcreatedexception",
+)
+
+_APP_CONTEXT_FAILURE_HINTS = (
+    "failed to load applicationcontext",
+    "error creating bean with name",
+    "beancreationexception",
+    "unsatisfieddependencyexception",
+    "invalid value type for attribute 'factorybeanobjecttype'",
+)
+
+_DEPENDENCY_CLASSPATH_MARKERS = (
+    "javax/servlet",
+    "javax.servlet",
+    "javax/validation",
+    "javax.validation",
+    "javax/persistence",
+    "javax.persistence",
+    "javax/xml",
+    "javax.xml",
+    "javax/annotation",
+    "javax.annotation",
+    "springdoc",
+    "springfox",
+    "factorybeanobjecttype",
+    "com/baomidou",
+    "com.baomidou",
+    "mybatis",
+    "rocketmq",
+    "org/mockito",
+    "org.mockito",
+    "org/jooq",
+    "org.jooq",
+    "org/hibernate",
+    "org.hibernate",
+)
+
+_MISSING_PACKAGE_RE = re.compile(
+    r"package\s+([a-zA-Z_][a-zA-Z0-9_.]*)\s+does\s+not\s+exist"
+)
+
+_MISSING_PACKAGE_TO_POM_DEPENDENCY: Tuple[Tuple[str, str, str], ...] = (
+    (
+        "jakarta.validation",
+        "org.springframework.boot:spring-boot-starter-validation",
+        "Spring Boot 3 BOM-managed Jakarta Validation starter (omit <version>)",
+    ),
+    (
+        "org.hibernate.validator",
+        "org.springframework.boot:spring-boot-starter-validation",
+        "Spring Boot 3 BOM-managed Hibernate Validator / Jakarta Validation starter (omit <version>)",
+    ),
+    (
+        "jakarta.xml.bind",
+        "jakarta.xml.bind:jakarta.xml.bind-api",
+        "Spring Boot 3 BOM-managed Jakarta XML Binding API (omit <version>)",
+    ),
+    (
+        "jakarta.activation",
+        "jakarta.activation:jakarta.activation-api",
+        "Spring Boot 3 BOM-managed Jakarta Activation API (omit <version>)",
+    ),
+    (
+        "jakarta.annotation",
+        "jakarta.annotation:jakarta.annotation-api",
+        "Spring Boot 3 BOM-managed Jakarta Annotations API (omit <version>)",
+    ),
+    (
+        "jakarta.mail",
+        "org.springframework.boot:spring-boot-starter-mail",
+        "Spring Boot 3 BOM-managed Jakarta Mail starter (omit <version>)",
+    ),
+    (
+        "jakarta.servlet",
+        "jakarta.servlet:jakarta.servlet-api",
+        "Spring Boot 3 BOM-managed Jakarta Servlet API (omit <version>)",
+    ),
+    (
+        "jakarta.persistence",
+        "jakarta.persistence:jakarta.persistence-api",
+        "Spring Boot 3 BOM-managed Jakarta Persistence API (omit <version>)",
+    ),
+    (
+        "jakarta.transaction",
+        "jakarta.transaction:jakarta.transaction-api",
+        "Spring Boot 3 BOM-managed Jakarta Transaction API (omit <version>)",
+    ),
+    (
+        "jakarta.el",
+        "jakarta.el:jakarta.el-api",
+        "Spring Boot 3 BOM-managed Jakarta Expression Language API (omit <version>)",
+    ),
+    (
+        "io.swagger.v3",
+        "org.springdoc:springdoc-openapi-starter-webmvc-ui:2.5.0",
+        "SpringDoc OpenAPI 3 starter for Spring Boot 3",
+    ),
+    (
+        "org.springdoc",
+        "org.springdoc:springdoc-openapi-starter-webmvc-ui:2.5.0",
+        "SpringDoc OpenAPI 3 starter for Spring Boot 3",
+    ),
 )
 
 _BEAN_NAME_RE = re.compile(r"Error creating bean with name '([A-Za-z0-9_$.]+)'")
@@ -50,6 +154,28 @@ _TEST_PROFILE_FILENAMES = (
     "application-test.yaml",
 )
 _MAVEN_LIFECYCLE_GOALS = {"clean", "compile", "test-compile", "test", "package", "verify", "install"}
+
+
+def is_dependency_classpath_runtime_failure(
+    failed_tests: List[TestFailure], raw_logs: str = ""
+) -> bool:
+    """Return True when runtime test failures point to an incompatible Boot 2 dependency in pom.xml."""
+    if not failed_tests:
+        return False
+    combined_parts = [
+        f"{t.failure_message} {t.stack_trace or ''}" for t in failed_tests
+    ]
+    if raw_logs:
+        combined_parts.append(raw_logs)
+    combined = " ".join(combined_parts).lower()
+    if any(hint in combined for hint in _TEST_HARNESS_FAILURE_HINTS):
+        return False
+    if "invalid value type for attribute 'factorybeanobjecttype'" in combined:
+        return True
+    has_classpath_err = any(hint in combined for hint in _CLASSPATH_FAILURE_HINTS)
+    has_app_context = any(hint in combined for hint in _APP_CONTEXT_FAILURE_HINTS)
+    has_dep_marker = any(marker in combined for marker in _DEPENDENCY_CLASSPATH_MARKERS)
+    return has_classpath_err and (has_app_context or has_dep_marker)
 
 
 def looks_like_app_runtime_failure(
@@ -63,9 +189,114 @@ def looks_like_app_runtime_failure(
     if raw_logs:
         combined_parts.append(raw_logs)
     combined = " ".join(combined_parts).lower()
-    if any(hint in combined for hint in _TEST_API_FAILURE_HINTS):
+    if any(hint in combined for hint in _TEST_HARNESS_FAILURE_HINTS):
+        return False
+    if is_dependency_classpath_runtime_failure(failed_tests, raw_logs):
+        return True
+    if any(hint in combined for hint in _CLASSPATH_FAILURE_HINTS):
         return False
     return any(hint in combined for hint in _APP_RUNTIME_FAILURE_HINTS)
+
+
+def detect_missing_pom_dependencies(
+    compiler_errors: List[CompilerError],
+) -> List[Tuple[str, str, str]]:
+    """Return (missing_pkg, maven_coord, reason) tuples for missing-package javac errors."""
+    results: List[Tuple[str, str, str]] = []
+    seen_coords: Set[str] = set()
+    for err in compiler_errors or []:
+        msg = err.message or ""
+        for match in _MISSING_PACKAGE_RE.finditer(msg):
+            pkg = match.group(1).strip()
+            for prefix, coord, reason in _MISSING_PACKAGE_TO_POM_DEPENDENCY:
+                if pkg == prefix or pkg.startswith(f"{prefix}."):
+                    if coord not in seen_coords:
+                        seen_coords.add(coord)
+                        results.append((pkg, coord, reason))
+                    break
+    return results
+
+
+def java_errors_only_missing_packages(
+    errors: List[CompilerError], missing_packages: Set[str]
+) -> bool:
+    """Return True when every compiler error on a Java file is caused by missing_packages."""
+    if not errors or not missing_packages:
+        return False
+    saw_missing_pkg = False
+    for err in errors:
+        msg = err.message or ""
+        pkg_match = _MISSING_PACKAGE_RE.search(msg)
+        if pkg_match:
+            pkg = pkg_match.group(1).strip()
+            if any(pkg == mp or pkg.startswith(f"{mp}.") for mp in missing_packages):
+                saw_missing_pkg = True
+                continue
+            return False
+        if "cannot find symbol" in msg.lower():
+            continue
+        return False
+    return saw_missing_pkg
+
+
+def detect_jooq_codegen_skip_defines(
+    repo_path: Path, require_existing_sources: bool = True
+) -> List[str]:
+    """Return Maven -D flags to skip DB-dependent jooq-codegen-maven when safe/needed."""
+    pom_path = Path(repo_path) / "pom.xml"
+    if not pom_path.is_file():
+        return []
+    try:
+        from lxml import etree as ET
+
+        parser = ET.XMLParser(remove_comments=True, recover=True)
+        root = ET.fromstring(pom_path.read_bytes(), parser=parser)
+    except Exception:
+        return []
+    if root is None:
+        return []
+
+    ns_uri = root.tag.split("}")[0].strip("{") if root.tag.startswith("{") else None
+    ns = {"m": ns_uri} if ns_uri else None
+    q = (lambda n: f"m:{n}") if ns_uri else (lambda n: n)
+
+    jooq_plugin = None
+    for plugin in root.findall(f".//{q('plugin')}", namespaces=ns):
+        aid = plugin.find(q("artifactId"), namespaces=ns)
+        if aid is not None and aid.text and aid.text.strip() == "jooq-codegen-maven":
+            jooq_plugin = plugin
+            break
+    if jooq_plugin is None:
+        return []
+
+    skip_prop: Optional[str] = None
+    skip_el = jooq_plugin.find(f".//{q('skip')}", namespaces=ns)
+    if skip_el is not None and skip_el.text:
+        raw_skip = skip_el.text.strip()
+        if raw_skip.startswith("${") and raw_skip.endswith("}"):
+            skip_prop = raw_skip[2:-1].strip()
+
+    has_existing_generated_sources = False
+    target_dir_el = jooq_plugin.find(f".//{q('target')}/{q('directory')}", namespaces=ns)
+    target_pkg_el = jooq_plugin.find(f".//{q('target')}/{q('packageName')}", namespaces=ns)
+    if target_dir_el is not None and target_dir_el.text:
+        base_dir = target_dir_el.text.strip().lstrip("./")
+        pkg_rel = (
+            target_pkg_el.text.strip().replace(".", "/")
+            if target_pkg_el is not None and target_pkg_el.text
+            else ""
+        )
+        candidate_dir = Path(repo_path) / base_dir / pkg_rel if pkg_rel else Path(repo_path) / base_dir
+        if candidate_dir.is_dir() and any(candidate_dir.rglob("*.java")):
+            has_existing_generated_sources = True
+
+    if require_existing_sources and not has_existing_generated_sources:
+        return []
+
+    defines = ["-Djooq.codegen.skip=true"]
+    if skip_prop and skip_prop != "jooq.codegen.skip":
+        defines.append(f"-D{skip_prop}=true")
+    return defines
 
 
 def extract_implicated_bean_stems(raw_logs: str) -> List[str]:
@@ -156,12 +387,28 @@ def resolve_sandbox_db_fallback_args(
     initial_maven_args: Optional[List[str]],
     current_maven_args: Optional[List[str]],
     tried_fallbacks: Set[str],
+    raw_logs: str = "",
 ) -> Optional[Tuple[str, str, List[str]]]:
     effective_current = (
         list(current_maven_args)
         if current_maven_args is not None
         else list(settings.sandbox_default_maven_args)
     )
+    if (
+        "jooq_skip" not in tried_fallbacks
+        and "jooq-codegen-maven" in (raw_logs or "").lower()
+    ):
+        skip_defines = detect_jooq_codegen_skip_defines(
+            repo_path, require_existing_sources=False
+        ) or ["-Djooq.codegen.skip=true", "-Djooq.skip=true"]
+        missing_defines = [d for d in skip_defines if d not in effective_current]
+        if missing_defines:
+            return (
+                "jooq_skip",
+                f"Skipping DB-dependent jOOQ codegen plugin ({' '.join(missing_defines)})",
+                insert_maven_defines(effective_current, missing_defines),
+            )
+
     if (
         "profile_test" not in tried_fallbacks
         and has_spring_test_profile(repo_path)

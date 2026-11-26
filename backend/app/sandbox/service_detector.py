@@ -518,6 +518,10 @@ def detect_required_services(
     ds_user = cfg.get("spring.datasource.username")
     ds_pass = cfg.get("spring.datasource.password")
     lower_logs = raw_logs.lower()
+    ds_uses_embedded = any(
+        ds_url.lower().startswith(prefix)
+        for prefix in ("jdbc:h2:", "jdbc:hsqldb:", "jdbc:derby:")
+    )
 
     services: Dict[str, ServiceRequirement] = {}
 
@@ -528,7 +532,7 @@ def detect_required_services(
         or "jdbc:mariadb:" in ds_url.lower()
         or "mysql" in ds_driver.lower()
         or "mariadb" in ds_driver.lower()
-        or mysql_compose is not None
+        or (mysql_compose is not None and not ds_uses_embedded)
         or "communications link failure" in lower_logs
         or ":3306" in lower_logs
         or (
@@ -568,7 +572,7 @@ def detect_required_services(
     if (
         "jdbc:postgresql:" in ds_url.lower()
         or "postgresql" in ds_driver.lower()
-        or pg_compose is not None
+        or (pg_compose is not None and not ds_uses_embedded)
         or ":5432" in lower_logs
         or "psqlexception" in lower_logs
         or (not ds_url and not has_embedded_db and "postgresql" in artifacts)
