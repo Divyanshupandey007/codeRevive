@@ -39,6 +39,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: coderevive-migrate-${{ inputs.repo_url }}
+  cancel-in-progress: true
+
 jobs:
   migrate:
     name: Run CodeRevive migration

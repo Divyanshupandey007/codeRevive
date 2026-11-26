@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from typing import Callable, List, Optional
 
@@ -14,7 +15,10 @@ from app.api.jobs import (
 from app.config import settings
 from app.integrations.github_actions_client import (
     GitHubActionsClient,
+    GitHubActionsNotFound,
     RunArtifact,
+    RunJob,
+    RunJobStep,
     RunStatus,
     WorkflowDispatchResult,
 )
@@ -29,14 +33,18 @@ class _FakeGHAClient:
         self.dispatch_result = WorkflowDispatchResult(
             run_id=9001, run_number=1, status="queued", html_url=None, raw={}
         )
-        self.status_sequence: List[RunStatus] = []
+        self.status_sequence: List = []
         self.repeat_status: Optional[RunStatus] = None
         self.cancelled_run_id: Optional[int] = None
         self.artifacts: List[RunArtifact] = []
         self.download_content: Optional[bytes] = None
+        self.job_steps_sequence: List[List[RunJob]] = []
+        self.dispatch_hook: Optional[Callable[[], None]] = None
 
     def dispatch_workflow(self, inputs, ref="main") -> WorkflowDispatchResult:
         self.calls.append(("dispatch", dict(inputs)))
+        if self.dispatch_hook is not None:
+            self.dispatch_hook()
         return self.dispatch_result
 
     def get_run_status(self, run_id: int) -> RunStatus:
@@ -44,7 +52,10 @@ class _FakeGHAClient:
         if self.repeat_status is not None:
             return self.repeat_status
         if self.status_sequence:
-            return self.status_sequence.pop(0)
+            nxt = self.status_sequence.pop(0)
+            if isinstance(nxt, BaseException):
+                raise nxt
+            return nxt
         return RunStatus(run_id=run_id, status="completed", conclusion="success")
 
     def cancel_run(self, run_id: int) -> bool:
@@ -53,6 +64,8 @@ class _FakeGHAClient:
         return True
 
     def get_job_steps(self, run_id: int) -> List:
+        if self.job_steps_sequence:
+            return self.job_steps_sequence.pop(0)
         return []
 
     def list_artifacts(self, run_id: int) -> List[RunArtifact]:
@@ -380,3 +393,208 @@ def test_execution_mode_defaults_to_local():
     assert settings.execution_mode == "local"
     # The module-level manager is configured for local execution by default.
     assert job_manager._execution_mode == "local"
+
+def test_gha_transient_404_after_dispatch_retries_and_recovers():
+    fake = _FakeGHAClient()
+    fake.status_sequence = [
+        GitHubActionsNotFound("404 while run materializes"),
+        GitHubActionsNotFound("still materializing"),
+        RunStatus(run_id=9001, status="queued"),
+        RunStatus(run_id=9001, status="in_progress"),
+        RunStatus(run_id=9001, status="completed", conclusion="success"),
+    ]
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0,
+    )
+    record = manager.submit(_make_request())
+    final = _wait_for(manager, record.job_id, lambda r: r.status == "COMPLETED")
+    assert final is not None
+    assert final.status == "COMPLETED"
+    assert final.error is None
+
+
+def test_gha_persistent_404_eventually_fails_with_run_not_found():
+    fake = _FakeGHAClient()
+    fake.status_sequence = [GitHubActionsNotFound("gone")] * 10
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0,
+    )
+    record = manager.submit(_make_request())
+    final = _wait_for(manager, record.job_id, lambda r: r.status == "FAILED")
+    assert final is not None
+    assert final.status == "FAILED"
+    assert final.error_type == "RunNotFound"
+
+
+def test_gha_step_polling_keeps_setup_steps_in_starting_stage_and_orders_start_first():
+    fake = _FakeGHAClient()
+    fake.status_sequence = [
+        RunStatus(run_id=9001, status="in_progress"),
+        RunStatus(run_id=9001, status="in_progress"),
+        RunStatus(run_id=9001, status="in_progress"),
+        RunStatus(run_id=9001, status="completed", conclusion="success"),
+    ]
+    fake.job_steps_sequence = [
+        [
+            RunJob(
+                job_id=1,
+                name="Run CodeRevive migration",
+                status="in_progress",
+                conclusion=None,
+                started_at=None,
+                completed_at=None,
+                steps=[
+                    RunJobStep(
+                        name="Checkout repository",
+                        status="in_progress",
+                        conclusion=None,
+                        number=1,
+                    )
+                ],
+            )
+        ],
+        [
+            RunJob(
+                job_id=1,
+                name="Run CodeRevive migration",
+                status="in_progress",
+                conclusion=None,
+                started_at=None,
+                completed_at=None,
+                steps=[
+                    RunJobStep(
+                        name="Build sandbox Docker image",
+                        status="in_progress",
+                        conclusion=None,
+                        number=2,
+                    )
+                ],
+            )
+        ],
+        [
+            RunJob(
+                job_id=1,
+                name="Run CodeRevive migration",
+                status="in_progress",
+                conclusion=None,
+                started_at=None,
+                completed_at=None,
+                steps=[
+                    RunJobStep(
+                        name="Run CodeRevive migration",
+                        status="in_progress",
+                        conclusion=None,
+                        number=3,
+                    )
+                ],
+            )
+        ],
+    ]
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0,
+    )
+    record = manager.submit(_make_request())
+    final = _wait_for(manager, record.job_id, lambda r: r.status == "COMPLETED")
+    assert final is not None
+    messages = [ev.message for ev in final.events]
+    start_idx = next(
+        i for i, m in enumerate(messages) if m.startswith("Starting migration for ")
+    )
+    prep_idx = messages.index("Preparing migration environment...")
+    assert start_idx < prep_idx
+    step_events = [
+        ev
+        for ev in final.events
+        if ev.message
+        in (
+            "Preparing migration environment...",
+            "Preparing verification sandbox environment...",
+            "Running migration pipeline...",
+        )
+    ]
+    assert len(step_events) == 3
+    assert all(ev.stage == "starting" for ev in step_events)
+
+
+def test_gha_concurrent_submit_does_not_double_dispatch():
+    fake = _FakeGHAClient()
+    fake.repeat_status = RunStatus(run_id=9001, status="in_progress")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_dispatch() -> None:
+        entered.set()
+        release.wait(timeout=2.0)
+
+    fake.dispatch_hook = slow_dispatch
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0,
+    )
+    first_result = []
+
+    def submit_first() -> None:
+        first_result.append(manager.submit(_make_request()))
+
+    t = threading.Thread(target=submit_first)
+    t.start()
+    assert entered.wait(timeout=2.0)
+
+    with pytest.raises(JobConflictError):
+        manager.submit(_make_request())
+
+    release.set()
+    t.join(timeout=2.0)
+    assert len(first_result) == 1
+    dispatch_calls = [c for c in fake.calls if c[0] == "dispatch"]
+    assert len(dispatch_calls) == 1
+    manager.cancel(first_result[0].job_id)
+
+
+def test_cancel_and_resubmit_different_repo_recovers_from_transient_404():
+    fake = _FakeGHAClient()
+    fake.repeat_status = RunStatus(run_id=9001, status="in_progress")
+    manager = MigrationJobManager(
+        execution_mode="github_actions",
+        github_client=fake,
+        max_concurrent_jobs=1,
+        poll_interval_seconds=0.02,
+    )
+    first = manager.submit(_make_request())
+    _wait_for(manager, first.job_id, lambda r: r.status == "RUNNING")
+    assert manager.cancel(first.job_id) is True
+
+    fake.dispatch_result = WorkflowDispatchResult(
+        run_id=9002, run_number=2, status="queued", html_url=None, raw={}
+    )
+    fake.repeat_status = None
+    fake.status_sequence = [
+        GitHubActionsNotFound("new run not visible yet"),
+        RunStatus(run_id=9002, status="in_progress"),
+        RunStatus(run_id=9002, status="completed", conclusion="success"),
+    ]
+    other_repo = MigrationJobRequest(
+        repo_url="https://github.com/org/other-app.git",
+        target_spring_boot="3.2.5",
+        target_java="17",
+        branch_name="migration/spring-boot-3",
+        use_openrewrite=True,
+        openrewrite_mode="hybrid",
+        retry_budget=5,
+    )
+    second = manager.submit(other_repo)
+    assert second.job_id == "gha_9002"
+    final = _wait_for(manager, second.job_id, lambda r: r.status == "COMPLETED")
+    assert final is not None
+    assert final.status == "COMPLETED"

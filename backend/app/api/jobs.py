@@ -114,11 +114,19 @@ def _map_gha_status(run_status: RunStatus) -> Tuple[JobStatus, str]:
 
 
 _GHA_MIGRATION_STEP_NAME = "Run CodeRevive migration"
-_GHA_MIGRATION_STEP_STAGE_FLOOR = "openrewrite"
+_GHA_HTTP_TIMEOUT_SECONDS = 30.0
+_GHA_NOT_FOUND_INITIAL_RETRIES = 6
+_GHA_NOT_FOUND_STEADY_RETRIES = 2
+_GHA_CANCEL_MAX_RETRIES = 3
 
 
 def _map_remote_step_to_event(step_name: str) -> Optional[Tuple[str, str]]:
-    """Translate internal runner step names into clean pipeline messages."""
+    """Translate internal runner step names into clean pipeline messages.
+
+    Keep pre-pipeline runner setup steps in the ``starting`` stage so the UI
+    never jumps ahead to ``VERIFYING_SANDBOX`` or ``OPENREWRITE`` before
+    ``run_migration.py`` reports ``ingesting`` and ``orchestrating``.
+    """
     lower = (step_name or "").strip().lower()
     if not lower:
         return None
@@ -129,9 +137,9 @@ def _map_remote_step_to_event(step_name: str) -> Optional[Tuple[str, str]]:
     ):
         return ("starting", "Preparing migration environment...")
     if "build sandbox" in lower or "docker" in lower:
-        return ("VERIFYING_SANDBOX", "Preparing verification sandbox environment...")
+        return ("starting", "Preparing verification sandbox environment...")
     if lower == _GHA_MIGRATION_STEP_NAME.lower():
-        return ("openrewrite", "Running migration pipeline...")
+        return ("starting", "Running migration pipeline...")
     # Suppress internal CI housekeeping steps (Set up job, Complete job, Upload artifact, Post ...)
     return None
 
@@ -173,6 +181,8 @@ class MigrationJobManager:
         self._gha_live_progress: Set[str] = set()
         self._active_pollers: Set[str] = set()
         self._removed_job_ids: Set[str] = set()
+        self._gha_cancel_confirmed: Set[str] = set()
+        self._pending_gha_dispatches: int = 0
         self._state_file = state_file
         if self._state_file is not None:
             self._load_state_locked()
@@ -240,6 +250,7 @@ class MigrationJobManager:
             self._cancel_flags.pop(jid, None)
             self._gha_live_progress.discard(jid)
             self._active_pollers.discard(jid)
+            self._gha_cancel_confirmed.discard(jid)
             self._removed_job_ids.add(jid)
         self._order = [jid for jid in self._order if jid not in to_remove]
         self._save_state_locked()
@@ -312,14 +323,21 @@ class MigrationJobManager:
                 if job.job_id.startswith(_GHA_JOB_ID_PREFIX)
                 and job.status in ("QUEUED", "RUNNING")
             )
-            if active_gha >= self._max_concurrent:
+            if active_gha + self._pending_gha_dispatches >= self._max_concurrent:
                 raise JobConflictError(
                     f"Maximum {self._max_concurrent} concurrent migration "
                     f"job(s) already running. Try again after one completes."
                 )
+            self._pending_gha_dispatches += 1
 
-        client = self._get_github_client()
-        dispatch = client.dispatch_workflow(_gha_inputs(request))
+        try:
+            client = self._get_github_client()
+            dispatch = client.dispatch_workflow(_gha_inputs(request))
+        except Exception:
+            with self._lock:
+                self._pending_gha_dispatches = max(0, self._pending_gha_dispatches - 1)
+            raise
+
         run_id = dispatch.run_id
         job_id = f"{_GHA_JOB_ID_PREFIX}{run_id}"
 
@@ -338,6 +356,9 @@ class MigrationJobManager:
         )
 
         with self._lock:
+            self._pending_gha_dispatches = max(0, self._pending_gha_dispatches - 1)
+            self._removed_job_ids.discard(job_id)
+            self._gha_cancel_confirmed.discard(job_id)
             self._jobs[job_id] = record
             if job_id not in self._order:
                 self._order.append(job_id)
@@ -375,9 +396,60 @@ class MigrationJobManager:
                     repo=settings.github_repo,
                     workflow_id=settings.github_workflow_id,
                     base_url=settings.github_api_base_url,
-                    timeout_seconds=float(settings.github_actions_job_timeout_seconds),
+                    timeout_seconds=_GHA_HTTP_TIMEOUT_SECONDS,
                 )
             return self._github_client
+
+    @staticmethod
+    def _wait_or_cancel(
+        cancel_flag: Optional[threading.Event], seconds: float
+    ) -> None:
+        if seconds <= 0:
+            return
+        if cancel_flag is not None:
+            cancel_flag.wait(seconds)
+        else:
+            sleep(seconds)
+
+    def _cancel_gha_run_with_retry(
+        self, client: GitHubActionsClient, job_id: str, run_id: int
+    ) -> None:
+        """Best-effort cancel with brief retries for newly-dispatched runs."""
+        with self._lock:
+            if job_id in self._gha_cancel_confirmed:
+                return
+        for attempt in range(1, _GHA_CANCEL_MAX_RETRIES + 1):
+            try:
+                if client.cancel_run(run_id):
+                    with self._lock:
+                        self._gha_cancel_confirmed.add(job_id)
+                    return
+            except GitHubActionsError:
+                pass
+            try:
+                if client.get_run_status(run_id).is_done:
+                    with self._lock:
+                        self._gha_cancel_confirmed.add(job_id)
+                    return
+            except GitHubActionsError:
+                pass
+            if attempt < _GHA_CANCEL_MAX_RETRIES and self._poll_interval > 0:
+                sleep(min(1.5 * attempt, float(self._poll_interval)))
+
+    def _append_gha_step_event(
+        self, job_id: str, stage: str, message: str
+    ) -> bool:
+        """Append a coarse runner step event only if live relay has not started."""
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is None or record.status in ("COMPLETED", "FAILED", "CANCELLED"):
+                return False
+            if job_id in self._gha_live_progress:
+                return False
+            record.stage = stage
+            record.events.append(MigrationJobEvent(stage=stage, message=message))
+            self._save_state_locked()
+            return True
 
     def _current_step_name(self, client: GitHubActionsClient, run_id: int) -> Optional[str]:
         """Best-effort: name of the step currently in_progress for this run."""
@@ -401,14 +473,13 @@ class MigrationJobManager:
             + settings.github_actions_job_timeout_seconds
         )
         last_step_message: Optional[str] = None
+        seen_run = False
+        consecutive_not_found = 0
 
         try:
             while True:
                 if cancel_flag is not None and cancel_flag.is_set():
-                    try:
-                        client.cancel_run(run_id)
-                    except (GitHubActionsError, Exception):
-                        pass
+                    self._cancel_gha_run_with_retry(client, job_id, run_id)
                     self._finalize_gha_job(
                         job_id, "CANCELLED", "cancelled", "Migration cancelled by user."
                     )
@@ -426,7 +497,29 @@ class MigrationJobManager:
 
                 try:
                     run_status = client.get_run_status(run_id)
+                    seen_run = True
+                    consecutive_not_found = 0
                 except GitHubActionsNotFound:
+                    with self._lock:
+                        has_live = job_id in self._gha_live_progress
+                    if has_live:
+                        seen_run = True
+                        self._wait_or_cancel(cancel_flag, float(self._poll_interval))
+                        continue
+                    consecutive_not_found += 1
+                    max_not_found = (
+                        _GHA_NOT_FOUND_STEADY_RETRIES
+                        if seen_run
+                        else _GHA_NOT_FOUND_INITIAL_RETRIES
+                    )
+                    if consecutive_not_found <= max_not_found:
+                        retry_delay = (
+                            min(float(consecutive_not_found), float(self._poll_interval))
+                            if self._poll_interval > 0
+                            else 0.0
+                        )
+                        self._wait_or_cancel(cancel_flag, retry_delay)
+                        continue
                     self._finalize_gha_job(
                         job_id,
                         "FAILED",
@@ -436,7 +529,7 @@ class MigrationJobManager:
                     )
                     return
                 except GitHubActionsError:
-                    sleep(self._poll_interval)
+                    self._wait_or_cancel(cancel_flag, float(self._poll_interval))
                     continue
 
                 status, stage = _map_gha_status(run_status)
@@ -464,7 +557,12 @@ class MigrationJobManager:
                         )
                     return
 
-                live_progress = job_id in self._gha_live_progress
+                # Update status first so "Starting migration for ..." precedes
+                # coarse runner setup step messages.
+                self._update_gha_job_status(job_id, status, stage)
+
+                with self._lock:
+                    live_progress = job_id in self._gha_live_progress
                 if run_status.status == "in_progress" and not live_progress:
                     step_name = self._current_step_name(client, run_id)
                     if step_name:
@@ -472,19 +570,12 @@ class MigrationJobManager:
                         if mapped is not None:
                             step_stage, step_msg = mapped
                             if step_msg != last_step_message:
-                                last_step_message = step_msg
-                                self._append_event(job_id, step_stage, step_msg)
-                            stage = step_stage
-                        if step_name == _GHA_MIGRATION_STEP_NAME:
-                            stage = _GHA_MIGRATION_STEP_STAGE_FLOOR
-                elif live_progress:
-                    with self._lock:
-                        record = self._jobs.get(job_id)
-                        if record is not None:
-                            stage = record.stage
+                                if self._append_gha_step_event(
+                                    job_id, step_stage, step_msg
+                                ):
+                                    last_step_message = step_msg
 
-                self._update_gha_job_status(job_id, status, stage)
-                sleep(self._poll_interval)
+                self._wait_or_cancel(cancel_flag, float(self._poll_interval))
         finally:
             with self._lock:
                 self._active_pollers.discard(job_id)
@@ -625,6 +716,7 @@ class MigrationJobManager:
                     self._jobs.pop(jid, None)
                     self._cancel_flags.pop(jid, None)
                     self._gha_live_progress.discard(jid)
+                    self._gha_cancel_confirmed.discard(jid)
                     evicted = True
                     break
             if not evicted:
@@ -888,11 +980,21 @@ class MigrationJobManager:
 
     def cancel(self, job_id: str) -> bool:
         """Request cancellation of a queued or running job."""
+        gha_run_id: Optional[int] = None
+        has_poller = False
         with self._lock:
             record = self._jobs.get(job_id)
             if record is None and self._state_file is not None:
                 self._load_state_locked()
                 record = self._jobs.get(job_id)
+
+        if record is None:
+            hydrated = self._hydrate_gha_job_from_remote(job_id)
+            if hydrated is None:
+                return False
+
+        with self._lock:
+            record = self._jobs.get(job_id)
             if record is None:
                 return False
             if record.status in ("COMPLETED", "FAILED", "CANCELLED"):
@@ -903,12 +1005,11 @@ class MigrationJobManager:
                 self._cancel_flags[job_id] = flag
             flag.set()
             if record.job_id.startswith(_GHA_JOB_ID_PREFIX):
-                run_id = int(record.job_id[len(_GHA_JOB_ID_PREFIX) :])
-                client = self._get_github_client()
                 try:
-                    client.cancel_run(run_id)
-                except GitHubActionsError:
-                    pass
+                    gha_run_id = int(record.job_id[len(_GHA_JOB_ID_PREFIX) :])
+                except ValueError:
+                    gha_run_id = None
+                has_poller = job_id in self._active_pollers
             record.status = "CANCELLED"
             record.stage = "cancelled"
             record.completed_at = _utc_now_iso()
@@ -919,7 +1020,25 @@ class MigrationJobManager:
                 )
             )
             self._save_state_locked()
-            return True
+
+        if gha_run_id is not None:
+            client = self._get_github_client()
+            cancelled_ok = False
+            try:
+                cancelled_ok = client.cancel_run(gha_run_id)
+            except GitHubActionsError:
+                cancelled_ok = False
+            if cancelled_ok:
+                with self._lock:
+                    self._gha_cancel_confirmed.add(job_id)
+            elif not has_poller:
+                threading.Thread(
+                    target=self._cancel_gha_run_with_retry,
+                    args=(client, job_id, gha_run_id),
+                    name=f"coderevive-gha-cancel-{gha_run_id}",
+                    daemon=True,
+                ).start()
+        return True
 
     def delete(self, job_id: str) -> bool:
         with self._lock:
@@ -941,6 +1060,7 @@ class MigrationJobManager:
             self._order = [jid for jid in self._order if jid != job_id]
             self._cancel_flags.pop(job_id, None)
             self._gha_live_progress.discard(job_id)
+            self._gha_cancel_confirmed.discard(job_id)
             self._removed_job_ids.add(job_id)
             self._save_state_locked()
             return True
@@ -951,6 +1071,8 @@ class MigrationJobManager:
             self._order.clear()
             self._cancel_flags.clear()
             self._gha_live_progress.clear()
+            self._gha_cancel_confirmed.clear()
+            self._pending_gha_dispatches = 0
             self._save_state_locked()
 
     # ------------------------------------------------------------------ #
