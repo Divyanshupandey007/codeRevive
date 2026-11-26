@@ -552,7 +552,18 @@ def build_api_router() -> APIRouter:
                 detail=f"Job '{job_id}' is not a GitHub Actions migration job.",
             )
         client = _get_github_client()
-        artifacts = client.list_artifacts(run_id)
+        try:
+            artifacts = client.list_artifacts(run_id)
+        except GitHubActionsNotFound:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Workflow run {run_id} not found.",
+            )
+        except GitHubActionsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Failed to list artifacts for run {run_id}: {exc}",
+            )
         return {
             "job_id": job_id,
             "run_id": run_id,
@@ -588,15 +599,23 @@ def build_api_router() -> APIRouter:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Artifact {artifact_id} not found for run {run_id}.",
             )
-        # Determine a sensible filename from the artifact name.
-        artifact = client.find_artifact_by_name(run_id, "")  # placeholder, replaced below
-        _ = artifact
-        # Look up the artifact name to set the download filename.
+        except GitHubActionsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Failed to download artifact {artifact_id}: {exc}",
+            )
+        # Look up the artifact name to set a clean .zip download filename.
         filename = f"artifact-{artifact_id}.zip"
         try:
             for a in client.list_artifacts(run_id):
-                if a.artifact_id == artifact_id:
-                    filename = a.name or filename
+                if a.artifact_id == artifact_id and a.name:
+                    safe_name = a.name.replace('"', "").replace("/", "_").replace("\\", "_").strip()
+                    if safe_name:
+                        filename = (
+                            safe_name
+                            if safe_name.lower().endswith(".zip")
+                            else f"{safe_name}.zip"
+                        )
                     break
         except GitHubActionsError:
             pass
@@ -605,7 +624,7 @@ def build_api_router() -> APIRouter:
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-Request-ID": "",
+                "Cache-Control": "no-store",
             },
         )
 

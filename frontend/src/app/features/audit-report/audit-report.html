@@ -22,6 +22,17 @@
         } @else {
           <span class="dim repo-link mono" [title]="s.repo_url">{{ repoShort() }}</span>
         }
+        @if (migratedSourceArtifact(); as zip) {
+          <button
+            type="button"
+            class="btn"
+            [disabled]="downloadingZip()"
+            [title]="'Download full migrated repository zip (' + formatArtifactSize(zip.size_in_bytes) + ') with branch ' + branchName()"
+            (click)="downloadMigratedZip()"
+          >
+            {{ downloadingZip() ? 'Downloading .zip…' : 'Download Repo (.zip)' }}
+          </button>
+        }
         <button type="button" class="btn" (click)="downloadPatch()">Download .patch</button>
         <button type="button" class="btn" (click)="exportJson()">Export JSON</button>
         <a class="btn btn-primary" routerLink="/launcher">← New Migration</a>
@@ -42,7 +53,7 @@
       <div class="panel kpi">
         <span class="kpi-label">Files Modernized</span>
         <span class="kpi-value mono">{{ s.total_files_migrated }}</span>
-        <span class="kpi-sub dim">{{ s.openrewrite_files_modified }} via OpenRewrite</span>
+        <span class="kpi-sub dim">{{ modernizationBreakdown() }}</span>
       </div>
       <div class="panel kpi">
         <span class="kpi-label">Repair</span>
@@ -67,10 +78,10 @@
           <button
             type="button"
             class="kpi-sub mono commit-link"
-            title="Local workspace commit (not pushed to remote) — click to copy SHA"
+            title="Created in the isolated migration workspace and not pushed to GitHub. Download the .patch or migrated .zip to apply locally. Click to copy SHA."
             (click)="copyFinalSha()"
           >
-            {{ copiedSha() ? 'Copied!' : shortSha(s.final_commit) + ' (local)' }}
+            {{ copiedSha() ? 'Copied!' : shortSha(s.final_commit) + (isGhaJob() ? ' (not pushed)' : ' (local)') }}
           </button>
         } @else if (isRemoteRepo() && baselineCommitUrl()) {
           <a class="kpi-sub mono commit-link" [href]="baselineCommitUrl()" target="_blank" rel="noopener noreferrer">
@@ -81,6 +92,27 @@
         }
       </div>
     </div>
+
+    @if (s.final_state === 'COMPLETED' && diffFileCount() > 0) {
+      <div class="panel apply-guide">
+        <div class="apply-copy">
+          <div class="apply-title">Apply changes locally (not pushed to GitHub)</div>
+          <p class="apply-desc muted">
+            CodeRevive creates <span class="mono">{{ branchName() }}</span> inside an isolated workspace and never pushes to your remote repository.
+            Download <span class="mono">.patch</span> and run these commands in your local repo@if (migratedSourceArtifact()) {, or use <span class="mono">Download Repo (.zip)</span> for the pre-committed workspace}.
+          </p>
+          @if (zipError(); as zErr) {
+            <div class="apply-error mono">{{ zErr }}</div>
+          }
+        </div>
+        <div class="apply-cmd-box">
+          <pre class="mono apply-cmd">{{ localApplyCommand() }}</pre>
+          <button type="button" class="btn btn-sm" (click)="copyApplyCommand()">
+            {{ copiedApplyCmd() ? 'Copied!' : 'Copy' }}
+          </button>
+        </div>
+      </div>
+    }
 
     @if (s.last_build_errors.length > 0) {
       <div class="panel build-errors">

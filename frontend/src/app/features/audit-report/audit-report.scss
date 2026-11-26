@@ -74,6 +74,53 @@
   text-decoration: underline;
 }
 
+.apply-guide {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 18px;
+}
+.apply-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.apply-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.apply-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.apply-error {
+  font-size: 11px;
+  color: var(--red);
+  margin-top: 2px;
+}
+.apply-cmd-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--canvas);
+  border: 1px solid var(--border);
+  flex: none;
+  max-width: 100%;
+}
+.apply-cmd {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--green);
+  white-space: pre;
+  overflow-x: auto;
+}
+
 .build-errors {
   padding: 12px 18px;
   border-color: rgba(239, 68, 68, 0.4);
@@ -242,6 +289,13 @@
   }
   .head-actions {
     flex-wrap: wrap;
+  }
+  .apply-guide {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .apply-cmd-box {
+    justify-content: space-between;
   }
   .kpis {
     grid-template-columns: repeat(2, minmax(0, 1fr));
