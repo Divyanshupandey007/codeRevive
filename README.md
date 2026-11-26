@@ -13,6 +13,7 @@
 ![Angular 21](https://img.shields.io/badge/Angular-21-dd0031?style=flat-square&logo=angular&logoColor=white)
 ![Spring Boot 2.x to 3.x](https://img.shields.io/badge/Spring%20Boot-2.x%20%E2%86%92%203.x-6db33f?style=flat-square&logo=springboot&logoColor=white)
 ![Docker Sandbox](https://img.shields.io/badge/Sandbox-Docker-2496ed?style=flat-square&logo=docker&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)](LICENSE)
 
 [Features](#features) • [Architecture](#architecture) • [Quick Start](#quick-start) • [Usage](#usage) • [Deployment](#deployment) • [Testing](#testing-and-benchmarks)
 
@@ -281,3 +282,7 @@ Measured with the deterministic mock LLM paired with real Tree-sitter AST analys
 
 > [!IMPORTANT]
 > CodeRevive currently targets **single-module Maven** Spring Boot 2.x → 3.x projects with standard `src/main/java`, `src/test/java`, and `src/main/resources` layouts. Multi-module Maven projects (`<modules>` in root `pom.xml`) and Gradle builds are explicitly rejected in the current release.
+
+## License
+
+Released under the [MIT License](LICENSE).
