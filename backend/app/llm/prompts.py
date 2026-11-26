@@ -179,6 +179,17 @@ def _build_compiler_repair_hints(compiler_errors:List[CompilerError])->str:
             "- Multipart: `org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder` lives in `httpclient5`, not `org.apache.hc.core5.http.io.entity.mime`."
         )
 
+    if any("does not exist" in m and "package " in m for m in lower_msgs):
+        notes.append(
+            "Note on `package ... does not exist` errors:\n"
+            "- If repairing `pom.xml`, add the missing Spring Boot 3 BOM-managed starter or Jakarta EE API "
+            "dependency (e.g., `org.springframework.boot:spring-boot-starter-validation` for `jakarta.validation.*`, "
+            "omitting `<version>` so the Spring Boot 3 parent BOM manages it).\n"
+            "- If repairing a `.java` file where the missing package is an optional nullability annotation "
+            "(such as `jakarta.validation.constraints.NotNull` replacing removed `com.sun.istack.NotNull`), "
+            "use `org.springframework.lang.NonNull` if `jakarta.validation` is not on the classpath."
+        )
+
     if not notes:
         return ""
     return "\n"+"\n".join(notes)

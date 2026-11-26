@@ -132,6 +132,35 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _summarize_failed_run(summary) -> str:
+    """Produce a concise, user-facing failure reason from a MigrationRunSummary."""
+    real_violations = [
+        v.strip()
+        for v in (summary.integrity_violations or [])
+        if v and v.strip()
+        and not v.strip().startswith("Migration aborted before a passing build")
+    ]
+    build_errors = [
+        e.strip() for e in (summary.last_build_errors or []) if e and e.strip()
+    ]
+    if not summary.integrity_passed and real_violations and not build_errors:
+        msg = f"Post-migration integrity check failed: {real_violations[0]}"
+    elif build_errors:
+        primary = build_errors[0]
+        if summary.total_retries > 0:
+            msg = (
+                f"Migration rolled back after {summary.total_retries} repair "
+                f"attempt(s): {primary}"
+            )
+        else:
+            msg = f"Migration rolled back: {primary}"
+    elif real_violations:
+        msg = f"Migration rolled back: {real_violations[0]}"
+    else:
+        msg = "Migration failed before a passing build was reached; workspace reverted to baseline."
+    return msg[:397] + "..." if len(msg) > 400 else msg
+
+
 def main() -> int:
     args = _parse_args()
     request = MigrationJobRequest(
@@ -251,6 +280,9 @@ def main() -> int:
         print("\nIntegrity violations:")
         for violation in summary.integrity_violations:
             print(f"  - {violation}")
+
+    if summary.final_state != WorkflowState.COMPLETED and publish_progress:
+        publish_progress(f"failed:{_summarize_failed_run(summary)}")
 
     return 0 if summary.final_state == WorkflowState.COMPLETED else 1
 

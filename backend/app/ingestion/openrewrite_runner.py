@@ -16,6 +16,7 @@ from app.ingestion.migration_rules import (
     is_jakarta_migratable_import,
 )
 from app.models.manifest import MigrationPlan
+from app.orchestrator.repair_heuristics import detect_jooq_codegen_skip_defines
 
 
 @dataclass
@@ -477,6 +478,79 @@ class DeterministicRewritePass:
         ET.indent(root, space="    ")
         return ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8") + "\n"
 
+    @staticmethod
+    def transform_config_resource(
+        rel_path: str, content: str, upgrade_mysql_driver: bool = False
+    ) -> str:
+        """Apply safe Spring Boot 3 config cleanups to application properties/YAML files."""
+        updated = content
+        if upgrade_mysql_driver and "com.mysql.jdbc.Driver" in updated:
+            updated = updated.replace("com.mysql.jdbc.Driver", "com.mysql.cj.jdbc.Driver")
+
+        suffix = Path(rel_path).suffix.lower()
+        if suffix == ".properties":
+            updated = re.sub(
+                r"(?m)^(\s*)spring\.redis\.",
+                r"\1spring.data.redis.",
+                updated,
+            )
+            return updated
+
+        if suffix in (".yml", ".yaml"):
+            lines = updated.splitlines(keepends=True)
+            # Only migrate a direct `spring: -> redis:` block when no sibling `data:` key exists
+            spring_indent: Optional[int] = None
+            has_sibling_data = False
+            redis_start: Optional[int] = None
+            redis_indent: Optional[int] = None
+            redis_end: Optional[int] = None
+
+            for idx, raw_line in enumerate(lines):
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped in ("---", "..."):
+                    if redis_start is not None and redis_end is None:
+                        redis_end = idx
+                    break
+                indent = len(raw_line) - len(raw_line.lstrip(" "))
+                if spring_indent is None:
+                    if re.match(r"^spring\s*:\s*(?:#.*)?$", stripped):
+                        spring_indent = indent
+                    continue
+                if indent <= spring_indent:
+                    if redis_start is not None and redis_end is None:
+                        redis_end = idx
+                    break
+                if redis_start is not None and redis_end is None and redis_indent is not None:
+                    if indent <= redis_indent:
+                        redis_end = idx
+                if redis_indent is None or indent == redis_indent:
+                    if re.match(r"^data\s*:\s*(?:#.*)?$", stripped):
+                        has_sibling_data = True
+                    elif redis_start is None and re.match(r"^redis\s*:\s*(?:#.*)?$", stripped):
+                        redis_start = idx
+                        redis_indent = indent
+                elif indent < (redis_indent or 0):
+                    if re.match(r"^data\s*:\s*(?:#.*)?$", stripped):
+                        has_sibling_data = True
+
+            if redis_start is not None and redis_indent is not None and not has_sibling_data:
+                if redis_end is None:
+                    redis_end = len(lines)
+                pad = " " * redis_indent
+                newline = "\r\n" if lines[redis_start].endswith("\r\n") else "\n"
+                nested: List[str] = [f"{pad}data:{newline}"]
+                for line in lines[redis_start:redis_end]:
+                    if line.strip():
+                        nested.append("  " + line)
+                    else:
+                        nested.append(line)
+                lines = lines[:redis_start] + nested + lines[redis_end:]
+                updated = "".join(lines)
+
+        return updated
+
     @classmethod
     def apply_to_repo(cls, repo_path: Path, plan: MigrationPlan) -> OpenRewriteExecutionResult:
         modified_files: List[str] = []
@@ -509,6 +583,42 @@ class DeterministicRewritePass:
                 updated = cls.transform_java_source(original)
                 if updated != original:
                     java_file.write_text(updated, encoding="utf-8")
+                    modified_files.append(rel)
+                    diffs[rel] = "".join(
+                        difflib.unified_diff(
+                            original.splitlines(keepends=True),
+                            updated.splitlines(keepends=True),
+                            fromfile=f"a/{rel}",
+                            tofile=f"b/{rel}",
+                        )
+                    )
+
+        upgrade_mysql_driver = any(
+            d.group_id == "mysql" and d.artifact_id == "mysql-connector-java"
+            for d in plan.dependencies
+        ) or any(
+            d.group_id == "com.mysql" and d.artifact_id == "mysql-connector-j"
+            for d in plan.dependencies
+        )
+        for res_root in (repo_path / "src" / "main" / "resources", repo_path / "src" / "test" / "resources"):
+            if not res_root.is_dir():
+                continue
+            for cfg_file in sorted(res_root.iterdir()):
+                if not cfg_file.is_file():
+                    continue
+                if not cfg_file.name.startswith("application") or cfg_file.suffix.lower() not in (
+                    ".yml",
+                    ".yaml",
+                    ".properties",
+                ):
+                    continue
+                rel = cfg_file.relative_to(repo_path).as_posix()
+                original = cfg_file.read_text(encoding="utf-8", errors="ignore")
+                updated = cls.transform_config_resource(
+                    rel, original, upgrade_mysql_driver=upgrade_mysql_driver
+                )
+                if updated != original:
+                    cfg_file.write_text(updated, encoding="utf-8")
                     modified_files.append(rel)
                     diffs[rel] = "".join(
                         difflib.unified_diff(
@@ -768,6 +878,9 @@ class OpenRewriteRunner:
                 else None
             )
             args = self.build_maven_args(recipes, dry_run=dry_run)
+            for define in detect_jooq_codegen_skip_defines(repo_path, require_existing_sources=False):
+                if define not in args:
+                    args.append(define)
             timeout_s = getattr(
                 self.executor, "openrewrite_timeout_seconds", settings.openrewrite_timeout_seconds
             )

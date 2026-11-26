@@ -167,6 +167,27 @@ _ARTIFACT_REPLACEMENTS = {
         False,
         "Upgrade Alibaba Druid Spring Boot starter from druid-spring-boot-starter to druid-spring-boot-3-starter:1.2.23",
     ),
+    ("org.springdoc", "springdoc-openapi-ui"): (
+        "org.springdoc",
+        "springdoc-openapi-starter-webmvc-ui",
+        "2.5.0",
+        False,
+        "SpringDoc 1.x uses javax.servlet and breaks Spring Boot 3; migrate to springdoc-openapi-starter-webmvc-ui:2.5.0",
+    ),
+    ("org.springdoc", "springdoc-openapi-webflux-ui"): (
+        "org.springdoc",
+        "springdoc-openapi-starter-webflux-ui",
+        "2.5.0",
+        False,
+        "SpringDoc 1.x breaks Spring Boot 3; migrate to springdoc-openapi-starter-webflux-ui:2.5.0",
+    ),
+    ("com.baomidou", "mybatis-plus-boot-starter"): (
+        "com.baomidou",
+        "mybatis-plus-spring-boot3-starter",
+        "3.5.7",
+        False,
+        "MyBatis-Plus Boot 2 starter breaks Spring Boot 3.2 (factoryBeanObjectType); migrate to mybatis-plus-spring-boot3-starter:3.5.7",
+    ),
 }
 
 _VERSIONED_UPGRADES = {
@@ -181,6 +202,10 @@ _VERSIONED_UPGRADES = {
     ("com.codeborne", "selenide"): (
         "7.2.3",
         "Upgrade Selenide for compatibility with Spring Boot 3 managed Selenium 4.x",
+    ),
+    ("org.apache.rocketmq", "rocketmq-spring-boot-starter"): (
+        "2.3.1",
+        "Upgrade RocketMQ Spring Boot starter to 2.3.1 for Spring Boot 3 / Jakarta compatibility",
     ),
 }
 
@@ -391,6 +416,143 @@ def _plan_dependency_action(
             notes="Replace removed hibernate-entitymanager with BOM-managed org.hibernate.orm:hibernate-core",
         )
 
+    if dep.group_id == "org.springdoc":
+        has_primary_springdoc_webmvc = any(
+            coord in scheduled_coords
+            for coord in (
+                ("org.springdoc", "springdoc-openapi-ui"),
+                ("org.springdoc", "springdoc-openapi-starter-webmvc-ui"),
+            )
+        )
+        has_primary_springdoc_webflux = any(
+            coord in scheduled_coords
+            for coord in (
+                ("org.springdoc", "springdoc-openapi-webflux-ui"),
+                ("org.springdoc", "springdoc-openapi-starter-webflux-ui"),
+            )
+        )
+        has_any_primary_springdoc = (
+            has_primary_springdoc_webmvc
+            or has_primary_springdoc_webflux
+            or ("org.springdoc", "springdoc-openapi-starter-webmvc-api") in scheduled_coords
+            or ("org.springdoc", "springdoc-openapi-starter-webflux-api") in scheduled_coords
+        )
+        if dep.artifact_id == "springdoc-openapi-security":
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="remove_artifact",
+                notes="springdoc-openapi-security was merged into springdoc-openapi-starter-common in SpringDoc 2.x; keeping 1.x breaks Spring Boot 3",
+            )
+        if dep.artifact_id == "springdoc-openapi-webmvc-core":
+            if has_primary_springdoc_webmvc:
+                return DependencyMigrationAction(
+                    group_id=dep.group_id,
+                    artifact_id=dep.artifact_id,
+                    current_version=dep.version,
+                    target_strategy="remove_artifact",
+                    notes="Redundant when migrating SpringDoc 1.x to springdoc-openapi-starter-webmvc-ui:2.5.0",
+                )
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="upgrade_artifact",
+                target_group_id="org.springdoc",
+                target_artifact_id="springdoc-openapi-starter-webmvc-api",
+                target_version="2.5.0",
+                notes="SpringDoc 1.x breaks Spring Boot 3; migrate to springdoc-openapi-starter-webmvc-api:2.5.0",
+            )
+        if dep.artifact_id == "springdoc-openapi-webflux-core":
+            if has_primary_springdoc_webflux:
+                return DependencyMigrationAction(
+                    group_id=dep.group_id,
+                    artifact_id=dep.artifact_id,
+                    current_version=dep.version,
+                    target_strategy="remove_artifact",
+                    notes="Redundant when migrating SpringDoc 1.x to springdoc-openapi-starter-webflux-ui:2.5.0",
+                )
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="upgrade_artifact",
+                target_group_id="org.springdoc",
+                target_artifact_id="springdoc-openapi-starter-webflux-api",
+                target_version="2.5.0",
+                notes="SpringDoc 1.x breaks Spring Boot 3; migrate to springdoc-openapi-starter-webflux-api:2.5.0",
+            )
+        if dep.artifact_id in ("springdoc-openapi-common", "springdoc-openapi-data-rest"):
+            if has_any_primary_springdoc:
+                return DependencyMigrationAction(
+                    group_id=dep.group_id,
+                    artifact_id=dep.artifact_id,
+                    current_version=dep.version,
+                    target_strategy="remove_artifact",
+                    notes=f"{dep.artifact_id} 1.x is superseded by SpringDoc 2.x starter modules",
+                )
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="upgrade_artifact",
+                target_group_id="org.springdoc",
+                target_artifact_id="springdoc-openapi-starter-common",
+                target_version="2.5.0",
+                notes="SpringDoc 1.x breaks Spring Boot 3; migrate to springdoc-openapi-starter-common:2.5.0",
+            )
+        if dep.artifact_id.startswith("springdoc-openapi-starter-") and ver_tuple is not None and ver_tuple < (2, 3):
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="upgrade_version",
+                target_version="2.5.0",
+                notes="Upgrade SpringDoc 2.x starter to 2.5.0 for Spring Boot 3.2 compatibility",
+            )
+
+    if key == ("com.baomidou", "mybatis-plus-spring-boot3-starter"):
+        if ver_tuple is not None and ver_tuple < (3, 5, 5):
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="upgrade_version",
+                target_version="3.5.7",
+                notes="Upgrade MyBatis-Plus Spring Boot 3 starter to 3.5.7 for Spring Boot 3.2 compatibility",
+            )
+        return DependencyMigrationAction(
+            group_id=dep.group_id,
+            artifact_id=dep.artifact_id,
+            current_version=dep.version,
+            target_strategy="keep_or_verify",
+            notes="MyBatis-Plus Spring Boot 3 starter already at compatible version",
+        )
+
+    if key == ("org.mockito", "mockito-inline"):
+        if pom.spring_boot_version and (ver_tuple is None or ver_tuple < (5, 0)):
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="remove_artifact",
+                notes="mockito-inline was merged into mockito-core 5.x (managed by Spring Boot 3 BOM); keeping 4.x breaks mockStatic at runtime",
+            )
+
+    if dep.group_id == "org.jooq":
+        if pom.spring_boot_version and ver_tuple is not None and ver_tuple < (3, 18):
+            if "jooq.version" in pom.properties:
+                properties_to_update["jooq.version"] = "3.18.14"
+            return DependencyMigrationAction(
+                group_id=dep.group_id,
+                artifact_id=dep.artifact_id,
+                current_version=dep.version,
+                target_strategy="upgrade_version",
+                target_version="3.18.14",
+                notes="Align pinned jOOQ < 3.18 dependency with Spring Boot 3.2 managed jOOQ 3.18.14",
+            )
+
     if key in _ARTIFACT_REPLACEMENTS:
         new_group, new_artifact, new_ver, remove_ver, notes = _ARTIFACT_REPLACEMENTS[key]
         return DependencyMigrationAction(
@@ -443,8 +605,9 @@ def _plan_dependency_action(
 
     if key == ("org.projectlombok", "lombok"):
         if ver_tuple is not None and ver_tuple < (1, 18, 30):
-            if "lombok.version" in pom.properties:
-                properties_to_update["lombok.version"] = "1.18.32"
+            for prop_name in ("lombok.version", "org.projectlombok.version"):
+                if prop_name in pom.properties:
+                    properties_to_update[prop_name] = "1.18.32"
             return DependencyMigrationAction(
                 group_id=dep.group_id,
                 artifact_id=dep.artifact_id,
@@ -638,6 +801,11 @@ def build_migration_plan(
             properties_to_update[prop] = resolved_java
     if "java.version" not in properties_to_update and pom.java_version != resolved_java:
         properties_to_update["java.version"] = resolved_java
+
+    if "jooq.version" in pom.properties and "jooq.version" not in properties_to_update:
+        jooq_prop_ver = _parse_version_tuple(pom.properties.get("jooq.version"))
+        if jooq_prop_ver is not None and jooq_prop_ver < (3, 18):
+            properties_to_update["jooq.version"] = "3.18.14"
 
     repositories_to_remove = [
         url

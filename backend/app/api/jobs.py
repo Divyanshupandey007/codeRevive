@@ -545,15 +545,8 @@ class MigrationJobManager:
                             "Migration cancelled by user.",
                         )
                     else:
-                        errors = self._gather_gha_failure_details(
-                            client, run_id, run_status
-                        )
-                        self._finalize_gha_job(
-                            job_id,
-                            "FAILED",
-                            "failed",
-                            errors or "Migration failed before completion.",
-                            error_type="WorkflowFailed",
+                        self._finalize_failed_gha_job(
+                            job_id, run_id, client, run_status
                         )
                     return
 
@@ -634,21 +627,27 @@ class MigrationJobManager:
                 record.summary = summary
             if summary_path is not None:
                 record.summary_path = summary_path
+            sanitized = _sanitize_error(message)
             if status == "FAILED":
-                record.error = _sanitize_error(message)
+                record.error = sanitized
                 record.error_type = error_type or "WorkflowFailed"
-            record.events.append(
-                MigrationJobEvent(stage=stage, message=_sanitize_error(message))
+            duplicate_tail = (
+                bool(record.events)
+                and record.events[-1].stage == stage
+                and record.events[-1].message in (sanitized, f"{stage}:{sanitized}")
             )
+            if not duplicate_tail:
+                record.events.append(
+                    MigrationJobEvent(stage=stage, message=sanitized)
+                )
             self._gha_live_progress.discard(job_id)
             self._save_state_locked()
 
-    def _finalize_successful_gha_job(
-        self, job_id: str, run_id: int, client: GitHubActionsClient
-    ) -> None:
-        """Download the summary artifact and mark the job completed."""
-        summary = None
-        summary_path = None
+    @staticmethod
+    def _download_gha_summary_artifact(
+        run_id: int, client: GitHubActionsClient
+    ) -> Tuple[Optional[MigrationRunSummary], Optional[str]]:
+        """Best-effort download and parse of the migration-run-summary artifact."""
         try:
             artifact = client.find_artifact_by_name(run_id, SUMMARY_ARTIFACT_NAME)
             if artifact is not None:
@@ -668,16 +667,126 @@ class MigrationJobManager:
                         )
                     report_json = archive.read(report_name)
                 summary = MigrationRunSummary.model_validate_json(report_json)
-                summary_path = f"gha_artifact:{run_id}:{artifact.artifact_id}"
+                return summary, f"gha_artifact:{run_id}:{artifact.artifact_id}"
         except (GitHubActionsError, ValueError, OSError, zipfile.BadZipFile):
-            summary = None
-            summary_path = f"gha_run:{run_id}"
+            return None, f"gha_run:{run_id}"
+        return None, None
 
+    @staticmethod
+    def _format_failure_from_summary(
+        summary: MigrationRunSummary,
+    ) -> Tuple[str, str]:
+        """Build a concise (message, error_type) pair from a failed MigrationRunSummary."""
+        real_violations = [
+            v.strip()
+            for v in (summary.integrity_violations or [])
+            if v
+            and v.strip()
+            and not v.strip().startswith("Migration aborted before a passing build")
+        ]
+        build_errors = [
+            e.strip() for e in (summary.last_build_errors or []) if e and e.strip()
+        ]
+        if not summary.integrity_passed and real_violations and not build_errors:
+            msg = f"Post-migration integrity guardrail failed: {real_violations[0]}"
+            return (msg[:397] + "..." if len(msg) > 400 else msg), "IntegrityGuardrailFailed"
+
+        if build_errors:
+            primary = build_errors[0]
+            lower = " ".join(build_errors[:3]).lower()
+            env_markers = (
+                "connection refused",
+                "communications link failure",
+                "cannot get jdbc connection",
+                "unable to acquire jdbc connection",
+                "redisconnectionfailureexception",
+                "mongosocketopenexception",
+                "timed out",
+                "outofmemoryerror",
+                "java heap space",
+                "could not transfer artifact",
+            )
+            is_conn_refused = "connection" in lower and "refused" in lower
+            if is_conn_refused or any(marker in lower for marker in env_markers):
+                msg = f"Sandbox environment failure: {primary}"
+                return (msg[:397] + "..." if len(msg) > 400 else msg), "EnvironmentFailure"
+            if summary.total_retries > 0:
+                msg = (
+                    f"Migration rolled back after {summary.total_retries} repair "
+                    f"attempt(s): {primary}"
+                )
+            else:
+                msg = f"Migration rolled back: {primary}"
+            return (msg[:397] + "..." if len(msg) > 400 else msg), "MigrationFailed"
+
+        if real_violations:
+            msg = f"Migration rolled back: {real_violations[0]}"
+            return (msg[:397] + "..." if len(msg) > 400 else msg), "IntegrityGuardrailFailed"
+
+        return (
+            f"Migration ended in state {summary.final_state.value}; workspace reverted to baseline.",
+            "WorkflowFailed",
+        )
+
+    def _finalize_successful_gha_job(
+        self, job_id: str, run_id: int, client: GitHubActionsClient
+    ) -> None:
+        """Download the summary artifact and mark the job completed."""
+        summary, summary_path = self._download_gha_summary_artifact(run_id, client)
         self._finalize_gha_job(
             job_id,
             "COMPLETED",
             "completed",
             "Migration completed successfully.",
+            summary=summary,
+            summary_path=summary_path,
+        )
+
+    def _finalize_failed_gha_job(
+        self,
+        job_id: str,
+        run_id: int,
+        client: GitHubActionsClient,
+        run_status: RunStatus,
+    ) -> None:
+        """Download any available audit summary and surface a root-cause failure reason."""
+        summary, summary_path = self._download_gha_summary_artifact(run_id, client)
+        error_msg = ""
+        error_type = "WorkflowFailed"
+
+        if summary is not None:
+            error_msg, error_type = self._format_failure_from_summary(summary)
+        else:
+            # Check whether the runner already relayed an explicit `failed:...` event
+            # (e.g., UnsupportedRepositoryError or LLMProviderError before summary upload).
+            with self._lock:
+                record = self._jobs.get(job_id)
+                relayed_failures = (
+                    [ev.message for ev in record.events if ev.stage == "failed" and ev.message]
+                    if record is not None
+                    else []
+                )
+            if relayed_failures:
+                raw_relayed = relayed_failures[-1]
+                error_msg = (
+                    raw_relayed[len("failed:"):].strip()
+                    if raw_relayed.startswith("failed:")
+                    else raw_relayed.strip()
+                )
+                if "not supported" in error_msg.lower():
+                    error_type = "UnsupportedRepositoryError"
+                elif "llm" in error_msg.lower() or "api key" in error_msg.lower():
+                    error_type = "LLMProviderError"
+
+        if not error_msg:
+            error_msg = self._gather_gha_failure_details(client, run_id, run_status)
+
+        self._finalize_gha_job(
+            job_id,
+            "FAILED",
+            "failed",
+            error_msg or "Migration failed before completion.",
+            error_type=error_type,
             summary=summary,
             summary_path=summary_path,
         )
@@ -819,12 +928,11 @@ class MigrationJobManager:
                 else:
                     record.status = "FAILED"
                     record.stage = "failed"
-                    record.error = _sanitize_error(
-                        "; ".join(result.summary.last_build_errors[:3])
-                        or "; ".join(result.summary.integrity_violations[:3])
-                        or f"Workflow ended in state {result.summary.final_state.value}"
+                    formatted_error, formatted_type = self._format_failure_from_summary(
+                        result.summary
                     )
-                    record.error_type = "WorkflowFailed"
+                    record.error = _sanitize_error(formatted_error)
+                    record.error_type = formatted_type
                     record.events.append(
                         MigrationJobEvent(
                             stage="failed",

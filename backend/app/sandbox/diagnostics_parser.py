@@ -183,13 +183,35 @@ def extract_test_failures(raw_logs: str) -> List[TestFailure]:
             stack_lines.append(lines[i].strip())
             i += 1
 
+        base_message = (
+            " ".join(message_lines)
+            if message_lines
+            else "(no failure message captured in logs)"
+        )
+        caused_by_lines: List[str] = []
+        for s_line in stack_lines:
+            if s_line.startswith("Caused by:"):
+                cleaned = s_line[len("Caused by:"):].strip()
+                if cleaned and cleaned not in caused_by_lines and cleaned not in base_message:
+                    caused_by_lines.append(cleaned)
+        if caused_by_lines:
+            selected_causes = (
+                [caused_by_lines[0], caused_by_lines[-1]]
+                if len(caused_by_lines) > 1
+                else [caused_by_lines[0]]
+            )
+            cause_suffix = " | Caused by: " + " -> ".join(selected_causes)
+            full_message = f"{base_message}{cause_suffix}"
+            if len(full_message) > 600:
+                full_message = full_message[:597] + "..."
+        else:
+            full_message = base_message
+
         failures.append(
             TestFailure(
                 test_class=test_class,
                 test_method=test_method,
-                failure_message=" ".join(message_lines)
-                if message_lines
-                else "(no failure message captured in logs)",
+                failure_message=full_message,
                 stack_trace="\n".join(stack_lines) if stack_lines else None,
             )
         )
