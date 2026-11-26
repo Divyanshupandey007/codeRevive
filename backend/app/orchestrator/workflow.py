@@ -565,6 +565,26 @@ class MigrationOrchestrator:
         except Exception:
             return None
 
+    def _git_diff_from_baseline(
+        self,
+        baseline_sha: Optional[str],
+        commit_sha: Optional[str],
+        file_path: str,
+    ) -> Optional[str]:
+        """Return the cumulative baseline-to-commit git diff for ``file_path``."""
+        if not baseline_sha or not commit_sha:
+            return None
+        try:
+            from git import Repo
+
+            repo = Repo(self.repo_path)
+            diff_text = repo.git.diff(
+                "--no-color", baseline_sha, commit_sha, "--", file_path
+            )
+            return diff_text if diff_text and diff_text.strip() else None
+        except Exception:
+            return None
+
     def _run_openrewrite_pass(
         self,
         plan: MigrationPlan,
@@ -1014,7 +1034,7 @@ class MigrationOrchestrator:
                     unmigrated_or_llm = [
                         fp
                         for fp in app_candidates
-                        if file_records[fp].applied_by in (None, "llm")
+                        if file_records[fp].applied_by in (None, "llm", "openrewrite+llm")
                     ]
                     high_risk_candidates = [
                         fp
@@ -1333,7 +1353,11 @@ class MigrationOrchestrator:
                         if diff and diff.strip():
                             self._manifest_cache.pop(fp, None)
                             record.state = FileStatus.PATCH_APPLIED
-                            record.applied_by = "llm"
+                            record.applied_by = (
+                                "openrewrite+llm"
+                                if record.applied_by in ("openrewrite", "openrewrite+llm")
+                                else "llm"
+                            )
                             record.diff = diff
                             repaired_any = True
                             if modified_files is not None:
@@ -1500,6 +1524,13 @@ class MigrationOrchestrator:
                 ),
                 file_path=None,
             )
+            baseline_sha = ingestion_report.repo_info.baseline_sha
+            for fp in migrated_paths:
+                cumulative_diff = self._git_diff_from_baseline(
+                    baseline_sha, commit_sha, fp
+                )
+                if cumulative_diff:
+                    file_records[fp].diff = cumulative_diff
             print(f" [COMMIT] {commit_sha[:10]} ({len(migrated_paths)} file(s))")
         else:
             reason = "Migration cancelled by user." if cancelled else "build or integrity checks failed"

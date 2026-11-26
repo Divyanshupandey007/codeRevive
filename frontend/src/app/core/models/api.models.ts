@@ -112,6 +112,20 @@ export interface DeleteJobResponse {
   job_id: string;
 }
 
+export interface JobArtifact {
+  artifact_id: number;
+  name: string;
+  size_in_bytes: number;
+  expired: boolean;
+  created_at: string | null;
+}
+
+export interface JobArtifactsResponse {
+  job_id: string;
+  run_id: number;
+  artifacts: JobArtifact[];
+}
+
 export interface HealthResponse {
   status: string;
   service: string;

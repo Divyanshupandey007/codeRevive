@@ -6,6 +6,7 @@ import {
   BackendConfig,
   DeleteJobResponse,
   HealthResponse,
+  JobArtifactsResponse,
   JobEventsResponse,
   JobListResponse,
   JobStatus,
@@ -147,5 +148,20 @@ export class CodeReviveService {
   /** GET /api/migrations/latest — latest completed migration summary (404 if none). */
   getLatestReport(): Observable<MigrationRunSummary> {
     return this.http.get<MigrationRunSummary>(`${this.api}/migrations/latest`);
+  }
+
+  /** GET /api/migrations/jobs/{id}/artifacts — workflow-run artifacts for GHA jobs. */
+  listJobArtifacts(jobId: string): Observable<JobArtifactsResponse> {
+    return this.http.get<JobArtifactsResponse>(
+      `${this.api}/migrations/jobs/${encodeURIComponent(jobId)}/artifacts`
+    );
+  }
+
+  /** GET /api/migrations/jobs/{id}/artifacts/{artifactId}/download — zip blob. */
+  downloadJobArtifact(jobId: string, artifactId: number): Observable<Blob> {
+    return this.http.get(
+      `${this.api}/migrations/jobs/${encodeURIComponent(jobId)}/artifacts/${artifactId}/download`,
+      { responseType: 'blob' }
+    );
   }
 }
