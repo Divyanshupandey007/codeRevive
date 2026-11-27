@@ -15,7 +15,7 @@
 ![Docker Sandbox](https://img.shields.io/badge/Sandbox-Docker-2496ed?style=flat-square&logo=docker&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square)](LICENSE)
 
-[Features](#features) • [Architecture](#architecture) • [Quick Start](#quick-start) • [Usage](#usage) • [Deployment](#deployment) • [Testing](#testing-and-benchmarks)
+[Features](#features) • [Architecture](#architecture) • [Quick Start](#quick-start) • [Usage](#usage) • [Deployment](#deployment) • [Evaluation](EVALUATION.md) • [Testing](#testing-and-benchmarks)
 
 </div>
 
@@ -267,6 +267,25 @@ Run the multi-repository evaluation benchmark across the three Spring Boot 2.7 t
 ```bash
 python backend/app/orchestrator/benchmark.py
 ```
+
+### Real-World Repository Evaluation
+
+Evaluated end-to-end against **11 public Spring Boot 2.x GitHub repositories** (`2.1.6`–`2.7.18`, Java 8/11/17 → Spring Boot `3.2.5`, Java 17) using `hybrid` OpenRewrite + LLM repair inside the hardened Docker sandbox:
+
+- **10 / 11 repositories (90.9%) migrated end-to-end** with passing sandbox verification and zero integrity violations (`5 / 10` with zero LLM retries).
+- **261 files migrated across passing runs**: **77.4%** (`202`) purely deterministic via OpenRewrite, **9.2%** (`24`) OpenRewrite + AI repair, **13.4%** (`35`) AI-only rewrites.
+- **1 / 11 safely rolled back** (`spring-boot-plus`) to its baseline commit after a custom JSqlParser 4.x interceptor break and guardrail abort—preventing partial commits.
+
+| Repository | Source → Target | Key Stack | Migrated (`OR`/`OR+AI`/`AI`) | Retries | Duration | Outcome |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| [`wkeyuan/DWSurvey`](https://github.com/wkeyuan/DWSurvey) | `2.7.18` (J8) → `3.2.5` (J17) | Hibernate 5→6, Shiro, SpringDoc, Redis, ES | **176** (`127`/`16`/`33`) | 25 | 29m 10s | **COMPLETED** |
+| [`Vinceli-9527/snap-meal`](https://github.com/Vinceli-9527/snap-meal) | `2.7.18` (J8) → `3.2.5` (J17) | JDBC, Redis, Bucket4j, SpringDoc, POI | **19** (`18`/`1`/`0`) | 1 | 1m 56s | **COMPLETED** |
+| [`melardev/JavaSpringBootOAuth2AsymmetricJwt_Separate_Crud`](https://github.com/melardev/JavaSpringBootOAuth2AsymmetricJwt_Separate_Crud) | `2.1.6` (J8) → `3.2.5` (J17) | OAuth2 Resource Server, Asymmetric JWT, JPA | **16** (`16`/`0`/`0`) | 0 | 1m 19s | **COMPLETED** |
+| [`kazuki43zoo/mybatis-spring-boot-jpetstore`](https://github.com/kazuki43zoo/mybatis-spring-boot-jpetstore) | `2.7.0` (J8) → `3.2.5` (J17) | MyBatis 3, Security 6, Thymeleaf 3.1, Chrome E2E | **14** (`12`/`1`/`1`) | 2 | 6m 22s | **COMPLETED** |
+| [`datevid/3.spring-boot-2.5.4-java8-securityJWT-jpa`](https://github.com/datevid/3.spring-boot-2.5.4-java8-securityJWT-jpa) | `2.5.4` (J8) → `3.2.5` (J17) | Security JWT, SpringFox→SpringDoc, JPA | **11** (`5`/`5`/`1`) | 7 | 3m 57s | **COMPLETED** |
+| [`geekidea/spring-boot-plus`](https://github.com/geekidea/spring-boot-plus) | `2.7.18` (J8) → `3.2.5` (J17) | MyBatis-Plus, custom JSqlParser, SpringDoc | **0** *(80 reverted)* | 4 | 18m 16s | **FAILED (Rolled Back)** |
+
+See **[EVALUATION.md](EVALUATION.md)** for the full 11-repository results table, baseline/final commit hashes, notable run breakdowns, and rollback/sandbox-boundary analysis.
 
 ### Offline Benchmark Results
 
